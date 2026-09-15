@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "name": "사진 왕복 넘기기",
+  "name": "실기기: 사진 왕복 (좌표 보정 후 1회 실행)",
   "app_profile": "photos",
   "device_profile": "my_iphone_portrait",
   "on_failure": "stop",
@@ -21,7 +21,7 @@
   "steps": [
     {
       "type": "repeat",
-      "count": 100,
+      "count": 1,
       "between_iterations_ms": 500,
       "steps": [
         {

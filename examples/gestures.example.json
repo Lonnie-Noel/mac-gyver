@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "제스처 설정 예제 (시작 화면 직접 준비)",
+  "app_profile": "photos",
+  "on_failure": "stop",
+  "setup": [],
+  "steps": [
+    {"type": "long_press", "name": "1.5초 길게 누르기", "target": {"mode": "normalized", "x": 0.5, "y": 0.5}, "press_duration_ms": 1500, "after_delay_ms": 1000},
+    {"type": "double_tap", "target": {"mode": "normalized", "x": 0.5, "y": 0.5}, "after_delay_ms": 1000},
+    {"type": "pinch", "name": "확대", "target": {"mode": "normalized", "x": 0.5, "y": 0.5}, "scale": 2, "velocity": 1, "after_delay_ms": 1000},
+    {"type": "pinch", "name": "축소", "target": {"mode": "normalized", "x": 0.5, "y": 0.5}, "scale": 0.5, "velocity": 1, "after_delay_ms": 1000},
+    {"type": "rotate", "name": "두 손가락 회전 입력", "target": {"mode": "normalized", "x": 0.5, "y": 0.5}, "angle_degrees": 45, "velocity_degrees": 90, "after_delay_ms": 1000},
+    {"type": "drag", "from": {"x": 0.3, "y": 0.5}, "to": {"x": 0.7, "y": 0.5}, "press_duration_ms": 500, "move_duration_ms": 800, "hold_duration_ms": 200},
+    {"type": "wait", "duration_ms": 1000},
+    {"type": "screenshot", "name": "제스처 입력 후 화면"}
+  ]
+}

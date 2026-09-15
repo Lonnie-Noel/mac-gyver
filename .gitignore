@@ -26,6 +26,8 @@ captures/
 recordings/
 reports/
 logs/
+.tools/
+.bootstrap-stamp
 *.log
 
 # macOS and editors

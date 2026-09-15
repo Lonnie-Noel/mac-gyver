@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "데모: 사진 A → B → A 왕복 검사",
+  "app_profile": "photos",
+  "device_profile": "demo",
+  "on_failure": "stop",
+  "setup": [
+    {
+      "type": "activate_app"
+    },
+    {
+      "type": "tap",
+      "target": {
+        "mode": "element",
+        "by": "accessibility_id",
+        "value": "photo-0"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "type": "repeat",
+      "count": 3,
+      "between_iterations_ms": 200,
+      "steps": [
+        {
+          "type": "assert_element",
+          "name": "사진 화면 표시 확인",
+          "target": {
+            "mode": "element",
+            "by": "accessibility_id",
+            "value": "photo-viewer"
+          },
+          "state": "visible"
+        },
+        {
+          "type": "assert_element",
+          "name": "사진 A 시작 확인",
+          "target": {
+            "mode": "element",
+            "by": "accessibility_id",
+            "value": "current-photo-0"
+          },
+          "state": "visible"
+        },
+        {
+          "type": "swipe",
+          "name": "다음 사진",
+          "from": {
+            "x": 0.8,
+            "y": 0.5
+          },
+          "to": {
+            "x": 0.2,
+            "y": 0.5
+          },
+          "move_duration_ms": 300,
+          "after_delay_ms": 300
+        },
+        {
+          "type": "assert_element",
+          "name": "사진 B로 전환 확인",
+          "target": {
+            "mode": "element",
+            "by": "accessibility_id",
+            "value": "current-photo-1"
+          },
+          "state": "visible"
+        },
+        {
+          "type": "screenshot",
+          "name": "다음 사진 캡처"
+        },
+        {
+          "type": "swipe",
+          "name": "이전 사진",
+          "from": {
+            "x": 0.2,
+            "y": 0.5
+          },
+          "to": {
+            "x": 0.8,
+            "y": 0.5
+          },
+          "move_duration_ms": 300,
+          "after_delay_ms": 300
+        },
+        {
+          "type": "assert_element",
+          "name": "사진 A 복귀 확인",
+          "target": {
+            "mode": "element",
+            "by": "accessibility_id",
+            "value": "current-photo-0"
+          },
+          "state": "visible"
+        }
+      ]
+    }
+  ]
+}

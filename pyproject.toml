@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mac-gyver"
+version = "0.1.0"
+description = "A macOS desktop recorder and runner for iPhone gesture tests"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+authors = [{name = "Lonnie-Noel"}]
+dependencies = [
+  "PySide6==6.11.2",
+  "Appium-Python-Client==5.3.1",
+  "selenium==4.49.0",
+  "Pillow==12.3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "build==1.6.1", "pyinstaller==6.22.3"]
+
+[project.scripts]
+mac-gyver = "mac_gyver.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mac_gyver = ["assets/*", "assets/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

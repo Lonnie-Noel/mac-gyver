@@ -1,0 +1,12 @@
+{
+  "server_url": "http://127.0.0.1:4723",
+  "udid": "REPLACE_WITH_YOUR_IPHONE_UDID",
+  "device_name": "iPhone",
+  "platform_version": "",
+  "bundle_id": "com.apple.mobileslideshow",
+  "team_id": "REPLACE_WITH_APPLE_TEAM_ID",
+  "wda_bundle_id": "com.yourname.macgyver.WebDriverAgentRunner",
+  "use_preinstalled_wda": false,
+  "command_timeout_seconds": 75,
+  "connect_timeout_seconds": 180
+}

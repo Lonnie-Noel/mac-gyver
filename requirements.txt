@@ -1,0 +1,5 @@
+# Direct runtime pins; kept equal to pyproject.toml.
+PySide6==6.11.2
+Appium-Python-Client==5.3.1
+selenium==4.49.0
+Pillow==12.3.0
