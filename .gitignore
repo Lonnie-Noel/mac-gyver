@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build outputs
+build/
+dist/
+
+# Local device settings and test captures
+.env
+.env.*
+!.env.example
+config.local.json
+device-profiles.local.json
+artifacts/
+captures/
+recordings/
+reports/
+logs/
+*.log
+
+# macOS and editors
+.DS_Store
+._*
+.idea/
+.vscode/
