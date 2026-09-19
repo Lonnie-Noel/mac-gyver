@@ -4,6 +4,16 @@
 
 **첫 구현 버전입니다. 아이폰 없이 사용할 수 있는 데모와 실제 기기용 Appium 연결을 제공합니다. 실제 아이폰 제스처와 macOS `.app` 실행 검증은 아직 완료되지 않았습니다.**
 
+## 사진 앨범 반복 자동화
+
+아이폰 사진 앱에서 프레임 재설정·드래그·재생성을 반복하는 전용 스크립트는 [`ios-automation/`](ios-automation/README.md)에 있습니다. 위 데스크톱 앱과 별도로 설치하고 실행합니다.
+
+- [설치 및 실행 안내](ios-automation/README.md): Xcode·Appium 준비, WDA 설치와 7일 서명 갱신, 시작·중지 방법
+- [JPEG 내보내기 안내](ios-automation/EDITED-IMAGE-EXPORT.md): 원래 파일명으로 전후 화면 캡처와 결과 JPEG 저장, 저장 검증 후 원본 복원
+- [PhotoKit 보조 앱 설치](ios-automation/ExportBridge/README.md): JPEG 모드에 필요한 PhotosExportBridge 빌드·설치
+
+기존 캡처·취소 흐름은 실제 아이폰에서 6장으로 확인했습니다. **0.2.0의 새 파일명 인식과 JPEG 저장·원본 복원 흐름은 오프라인 테스트 및 보조 앱 시뮬레이터 빌드까지 확인했으며, 실기기 통합 검증은 아직 남아 있습니다.** 개인 기기·서명 설정, 사진, 캡처, 로그는 저장소에 포함하지 않습니다.
+
 ## 바로 실행
 
 1. Python **3.11~3.14**가 있는 맥에서 저장소를 내려받습니다.

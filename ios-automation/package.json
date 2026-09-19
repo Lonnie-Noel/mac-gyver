@@ -1,0 +1,32 @@
+{
+  "name": "macgyver-ios-automation",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Appium environment for a USB-connected iPhone",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "0.9.12",
+    "appium": "3.7.0",
+    "appium-xcuitest-driver": "12.12.5",
+    "webdriverio": "9.31.9"
+  },
+  "scripts": {
+    "start": "mkdir -p logs && appium --address 127.0.0.1 --port 4723 --base-path / --log-level info --log-no-colors --log logs/appium.log",
+    "doctor": "appium driver doctor xcuitest",
+    "wda:open": "appium driver run xcuitest open-wda",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:check": "node scripts/smoke.mjs --check",
+    "photos:connect": "node scripts/phone.mjs start",
+    "photos:batch": "node scripts/photos-batch.mjs",
+    "photos:disconnect": "node scripts/phone.mjs end",
+    "photos": "node scripts/run-photos.mjs",
+    "photos:stop": "node scripts/run-photos.mjs --stop",
+    "photos:recover": "node scripts/run-photos.mjs --recover",
+    "test": "node --test tests/*.test.mjs",
+    "devices": "xcrun devicectl list devices --timeout 20",
+    "release:zip": "node scripts/package-release.mjs"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules/
+.env
+.appium/
+artifacts/
+logs/
+DerivedData/
+dist/
+.DS_Store

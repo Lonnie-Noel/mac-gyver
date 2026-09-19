@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleDevelopmentRegion</key><string>ko</string>
+    <key>CFBundleDisplayName</key><string>Photos Export Bridge</string>
+    <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSRequiresIPhoneOS</key><true/>
+    <key>UIFileSharingEnabled</key><true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+    <key>NSPhotoLibraryUsageDescription</key><string>선택한 사진의 편집 결과를 Mac으로 내보내고 검증 후 원본으로 복원하기 위해 사진 접근이 필요합니다.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key><string>Mac에서 내보낸 파일을 검증한 후 사진의 편집을 원본으로 복원합니다.</string>
+    <key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key><true/>
+    <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+    <key>UILaunchScreen</key><dict/>
+    <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+</dict></plist>

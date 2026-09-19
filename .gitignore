@@ -35,3 +35,15 @@ logs/
 ._*
 .idea/
 .vscode/
+
+# iPhone automation dependencies and local Xcode signing data
+node_modules/
+.appium/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+*.key
