@@ -1,0 +1,22 @@
+{
+  "name": "macgyver-macos-photos-automation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local macOS Photos Reframe automation with verified exports and recovery.",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "setup": "node scripts/run.mjs setup",
+    "check": "node scripts/run.mjs check",
+    "inspect": "node scripts/run.mjs inspect",
+    "albums": "node scripts/run.mjs albums",
+    "plan": "node scripts/run.mjs plan",
+    "start": "node scripts/run.mjs run",
+    "stop": "node scripts/run.mjs stop",
+    "recover": "node scripts/run.mjs recover"
+  }
+}

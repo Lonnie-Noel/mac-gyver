@@ -1,0 +1,8 @@
+{
+  "albumId": null,
+  "minimumGenerationSeconds": 25,
+  "generationTimeoutSeconds": 300,
+  "dragRadiusFactor": 0.5,
+  "dragDurationMs": 1500,
+  "pollIntervalMs": 750
+}

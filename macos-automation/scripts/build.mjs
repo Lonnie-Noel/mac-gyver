@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import fs from 'node:fs/promises';
+
+const execFileAsync = promisify(execFile);
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const buildRoot = path.join(projectRoot, 'build');
+const logRoot = path.join(projectRoot, 'logs');
+const logPath = path.join(logRoot, 'build.log');
+const appPath = path.join(buildRoot, 'MacPhotosBridge.app');
+const markerPath = path.join(buildRoot, '.source-hash');
+const bundleId = 'local.macgyver.photosautomation';
+const signingIdentity = process.env.MACOS_SIGNING_IDENTITY?.trim() || '-';
+let temporaryRoot;
+let buildLog;
+
+async function exists(filename) {
+  try {
+    await fs.access(filename);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function requireStoppedBridge() {
+  let running = false;
+  try {
+    const result = await execFileAsync('/usr/bin/pgrep', ['-x', 'MacPhotosBridge'], { encoding: 'utf8' });
+    running = result.stdout.trim().length > 0;
+  } catch (error) {
+    // pgrep returns 1 when no process has the exact requested name.
+    if (error.code !== 1) throw error;
+  }
+  if (running) {
+    throw new Error('MacPhotosBridge가 실행 중입니다. 도우미 설정 창의 “보조 앱 종료” 버튼 또는 활성 상태 보기에서 종료한 뒤 다시 빌드하세요. 실행 중인 앱을 자동 종료하지 않습니다.');
+  }
+}
+
+async function command(executable, args) {
+  await buildLog.appendFile(`\n${executable} ${JSON.stringify(args)}\n`);
+  try {
+    const result = await execFileAsync(executable, args, {
+      cwd: projectRoot,
+      env: process.env,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    await buildLog.appendFile(result.stdout + result.stderr);
+    return result;
+  } catch (error) {
+    await buildLog.appendFile((error.stdout || '') + (error.stderr || '') + `${error.message}\n`);
+    throw error;
+  }
+}
+
+async function main() {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major !== 22 || minor < 12) {
+    throw new Error(`Node.js 22.12 이상, 23 미만이 필요합니다. 현재: ${process.versions.node}`);
+  }
+  if (process.platform !== 'darwin') throw new Error('이 빌드는 macOS에서만 실행할 수 있습니다.');
+  if (await exists(path.join(projectRoot, 'artifacts', 'pending-edit.json'))) {
+    throw new Error('미완료 편집 기록이 있습니다. 기존 앱으로 recover를 완료한 뒤 빌드하세요.');
+  }
+  const nativeRoot = path.join(projectRoot, 'native');
+  const swiftSources = (await fs.readdir(nativeRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.swift'))
+    .map((entry) => path.join(nativeRoot, entry.name)).sort();
+  if (swiftSources.length === 0) throw new Error('native/*.swift 소스가 없습니다.');
+  const plistPath = path.join(nativeRoot, 'Info.plist');
+  const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x86_64' : null;
+  if (!arch) throw new Error(`지원하지 않는 Mac 아키텍처입니다: ${process.arch}`);
+  const hash = createHash('sha256');
+  hash.update(JSON.stringify({ bundleId, signingIdentity, arch }));
+  for (const filename of [...swiftSources, plistPath, fileURLToPath(import.meta.url)]) {
+    hash.update(path.relative(projectRoot, filename));
+    hash.update('\0');
+    hash.update(await fs.readFile(filename));
+    hash.update('\0');
+  }
+  const sourceHash = hash.digest('hex');
+  let previousHash = '';
+  try { previousHash = (await fs.readFile(markerPath, 'utf8')).trim(); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+
+  if (previousHash === sourceHash && await exists(path.join(appPath, 'Contents', 'MacOS', 'MacPhotosBridge'))) {
+    try {
+      await execFileAsync('/usr/bin/codesign', ['--verify', '--strict', appPath]);
+      console.log(`소스 변경 없음: 기존 앱을 사용합니다.\n${appPath}`);
+      return;
+    } catch {
+      console.log('기존 앱 서명을 검증할 수 없어 다시 빌드합니다.');
+    }
+  }
+
+  await requireStoppedBridge();
+
+  await fs.mkdir(buildRoot, { recursive: true, mode: 0o700 });
+  await fs.mkdir(logRoot, { recursive: true, mode: 0o700 });
+  await fs.chmod(logRoot, 0o700);
+  buildLog = await fs.open(logPath, 'w', 0o600);
+  await buildLog.chmod(0o600);
+  await buildLog.appendFile(`MacPhotosBridge build ${new Date().toISOString()}\n`);
+  temporaryRoot = await fs.mkdtemp(path.join(buildRoot, '.bridge-build-'));
+  const temporaryApp = path.join(temporaryRoot, 'MacPhotosBridge.app');
+  const contentsPath = path.join(temporaryApp, 'Contents');
+  const executablePath = path.join(contentsPath, 'MacOS', 'MacPhotosBridge');
+  await fs.mkdir(path.dirname(executablePath), { recursive: true, mode: 0o755 });
+  await fs.copyFile(plistPath, path.join(contentsPath, 'Info.plist'));
+  await command('/usr/bin/plutil', ['-lint', path.join(contentsPath, 'Info.plist')]);
+  const compilerArgs = [
+    'swiftc', '-swift-version', '5', '-parse-as-library', '-target', `${arch}-apple-macosx15.2`, '-O',
+    '-module-cache-path', path.join(buildRoot, '.module-cache'),
+    '-framework', 'Foundation', '-framework', 'AppKit',
+    '-framework', 'ApplicationServices', '-framework', 'Photos',
+    '-framework', 'ScreenCaptureKit', '-framework', 'CoreGraphics', '-framework', 'ImageIO',
+    '-framework', 'CoreImage', '-framework', 'CryptoKit', '-framework', 'UniformTypeIdentifiers',
+    ...swiftSources, '-o', executablePath,
+  ];
+  console.log('Mac 사진 자동화 도우미를 빌드합니다.');
+  await command('/usr/bin/xcrun', compilerArgs);
+  await fs.chmod(executablePath, 0o755);
+  await command('/usr/bin/codesign', ['--force', '--sign', signingIdentity, '--identifier', bundleId, temporaryApp]);
+  await command('/usr/bin/codesign', ['--verify', '--strict', temporaryApp]);
+
+  // A helper launched while compilation was running must not keep an old binary alive.
+  await requireStoppedBridge();
+
+  // Keep the previous app until the replacement is fully compiled and signed.
+  const previousApp = path.join(temporaryRoot, 'previous.app');
+  const hadPreviousApp = await exists(appPath);
+  if (hadPreviousApp) await fs.rename(appPath, previousApp);
+  try {
+    await fs.rename(temporaryApp, appPath);
+  } catch (error) {
+    if (hadPreviousApp) await fs.rename(previousApp, appPath);
+    throw error;
+  }
+  const temporaryMarker = path.join(temporaryRoot, 'source-hash');
+  await fs.writeFile(temporaryMarker, `${sourceHash}\n`, { mode: 0o600 });
+  await fs.rename(temporaryMarker, markerPath);
+  console.log(`빌드와 서명 검증 완료:\n${appPath}\n로그: ${logPath}`);
+  if (signingIdentity === '-') {
+    console.log('로컬 임시 서명을 사용했습니다. 소스 변경 후 다시 빌드하면 macOS 권한 재승인이 필요할 수 있습니다.');
+  }
+}
+
+try {
+  await main();
+} catch (error) {
+  console.error(`빌드 실패: ${error.message}`);
+  if (buildLog) console.error(`상세 로그: ${logPath}`);
+  process.exitCode = 1;
+} finally {
+  await buildLog?.close();
+  if (temporaryRoot) await fs.rm(temporaryRoot, { recursive: true, force: true });
+}
