@@ -2,7 +2,7 @@
 
 ## 구현 상태
 
-0.2.0에는 평면 캡처 저장, PhotoKit 보조 앱, USB JPEG 전송·검증, 원본 복원 및 중단 복구 코드가 들어 있다. **오프라인 테스트와 보조 앱의 무서명 시뮬레이터 빌드를 확인했다. 실제 아이폰에서 새 파일명 조회부터 JPEG 저장·복원까지 한 장을 처리하는 통합 검증은 아직이다.**
+0.2.1에는 평면 캡처 저장, PhotoKit 보조 앱, USB JPEG 전송·검증, 원본 복원 및 중단 복구 코드가 들어 있다. **2026-09-19 실제 아이폰에서 한 장의 식별 → 편집/재생성 → PNG 2개·JPEG 1개 저장 → 원본 복원을 통과했다.** JPEG 2592 × 1936 픽셀의 전체 디코딩·해시·바이트 수, 복원 후 같은 asset의 원본/현재 이미지 해시 일치와 편집 없음, 사진 뷰어 복귀, 미완료 복구 기록 없음을 확인했다. 오프라인 테스트 67개와 실기기 서명 빌드·설치도 통과했다. 전체 앨범 처리와 강제 중단 후 실기기 복구는 아직이다.
 
 기본 설정은 캡처 후 취소다. [README의 보조 앱 설치](README.md#3-6-실제-jpeg-파일-저장용-보조-앱)를 마치고 `.env`에 `IOS_EXPORT_BUNDLE_ID`를 입력하면 JPEG 모드를 사용한다. 별도 보조 앱은 [ExportBridge](ExportBridge/README.md)에 있다.
 
@@ -24,7 +24,7 @@ JPEG는 PhotoKit `.current`의 최대 크기 데이터를 방향에 맞춰 **8�
 ## 처리 순서
 
 1. Photos 정보 화면에서 원래 파일명을 읽는다. 인식할 수 없거나 여러 후보가 있으면 편집 전에 중단한다.
-2. 보조 앱이 전체 사진 보관함에서 원래 파일명이 일치하는 **단 한 장**을 찾고 asset ID, 원본 해시, 편집 전 현재 이미지 해시와 편집 여부를 기록한다. 확장자가 숨겨진 카메라 이름도 지원한다.
+2. 보조 앱이 전체 사진 보관함에서 원래 파일명과, 읽을 수 있는 경우 정보 패널의 촬영일시·픽셀 크기가 모두 일치하는 **단 한 장**을 찾고 asset ID, 원본 해시, 편집 전 현재 이미지 해시와 편집 여부를 기록한다. 확장자가 숨겨진 카메라 이름도 지원한다.
 3. 이미 편집된 사진은 건너뛴다. 미편집 사진만 Reframe 드래그·생성을 수행하고 PNG 두 장을 저장한다.
 4. Mac에 `pending-photo-edit.json`을 먼저 기록한 뒤 **Save → 필요한 경우 완료**로 결과를 사진에 적용한다.
 5. 보조 앱이 같은 asset ID의 편집된 `.current` 데이터를 JPEG로 만들어 `Documents/<요청UUID>-result.jpg`에 저장한다.
@@ -36,7 +36,9 @@ JPEG는 PhotoKit `.current`의 최대 크기 데이터를 방향에 맞춰 **8�
 
 ## 사진 식별과 기존 편집
 
-화면 파일명은 PhotoKit의 `PHAssetResource.originalFilename`과 연결한다. 보조 앱은 처음 대응시킨 뒤 **asset ID와 원본 해시**를 사용한다. 보관함에 이름이 같은 사진이 여러 장이면 중단하며, 제한된 사진 접근에서 중복을 놓치지 않도록 전체 접근을 요구한다. 화면의 날짜·크기로 중복 사진을 자동 추정하는 기능은 현재 없다. [Apple 원본 파일명](https://developer.apple.com/documentation/photos/phassetresource/originalfilename)
+화면 파일명은 PhotoKit의 `PHAssetResource.originalFilename`과 연결한다. 정보 패널에 촬영일시와 픽셀 크기가 있으면 기기의 현지 Gregorian 시각을 분 단위로 대조하고 가로·세로 픽셀 수도 정확히 비교한다. 모든 조건에 맞는 후보가 단 한 장이어야 하며, 없거나 여러 장이면 중단한다. 날짜·크기를 읽을 수 없으면 파일명 자체가 고유해야 한다. 제한된 사진 접근에서 중복을 놓치지 않도록 전체 접근을 요구한다. [Apple 원본 파일명](https://developer.apple.com/documentation/photos/phassetresource/originalfilename)
+
+처음 대응시킨 뒤에는 **asset ID와 원본 해시**를 사용한다. 복구 시에는 저장된 asset ID·원본 해시로 동일 사진을 다시 조회하고 보조 앱의 초기 기록까지 대조한다. 편집으로 달라질 수 있는 픽셀 크기를 복구 대상 선택에 다시 사용하지 않는다.
 
 **“원본으로 복귀”는 기존 편집 전체를 제거한다.** 그래서 현재 구현은 미편집 사진만 처리하고 기존 편집은 `skipped-existing-edits`로 기록한다. PhotoKit의 편집 상태와 adjustment 리소스를 확인한다. [Apple 복원 API](https://developer.apple.com/documentation/photos/phassetchangerequest/revertassetcontenttooriginal%28%29?language=objc)
 
@@ -60,6 +62,6 @@ npm run photos:recover
 
 - 시험 사진 한 장에서 PNG 2개·JPEG 1개를 얻고 JPEG가 리프레임 결과와 일치하는지 확인한다.
 - 복원 후 같은 사진이 실행 전 상태인지 확인한다.
-- 기존 편집 사진과 중복 파일명은 각각 건너뛰기·중단하는지 확인한다.
+- 기존 편집 사진은 건너뛰고, 촬영일시·크기까지 중복된 사진은 중단하는지 확인한다. 파일명만으로 중복된 후보를 차단하고 추가 정보로 고유한 한 장을 식별하는 흐름은 실기기에서 확인했다.
 - 저장 직후, 전송 중, Mac 검증 후, 복원 직후 중단한 기록을 복구한다.
 - 전체 앨범 검증 전에는 위 한 장 검사를 먼저 수행한다.

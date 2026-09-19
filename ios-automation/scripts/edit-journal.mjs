@@ -61,7 +61,10 @@ export async function recoverPendingEdit({ pending, bridge, verifyViewer, persis
   stop();
   await verifyViewer(pending);
   stop();
-  const current = await bridge.inspect(pending.baseline.originalFilename, { preserveBaseline: true });
+  // A saved edit can change dimensions. Recover by the recorded asset identity
+  // and original hash, not by its now-stale initial selection hints or filename alone.
+  const current = await bridge.inspect(pending.baseline.originalFilename, { preserveBaseline: true,
+    assetId: pending.baseline.assetId, baselineOriginalSHA256: pending.baseline.originalSHA256 });
   if (current.assetId !== pending.baseline.assetId
     || current.originalSHA256 !== pending.baseline.originalSHA256
     || pending.baseline.hasAdjustments !== false) {

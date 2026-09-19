@@ -14,6 +14,62 @@ private struct BridgeRequest: Codable {
     let baselineOriginalSHA256: String?
     let verifiedExportSHA256: String?
     let preserveBaseline: Bool?
+    let selection: AssetSelection?
+}
+
+private struct CreationLocal: Codable, Equatable {
+    let year: Int
+    let month: Int
+    let day: Int
+    let hour: Int
+    let minute: Int
+}
+
+// Photos' information panel displays the creation date to the local minute.
+// These fields only narrow the filename candidates; ambiguity still fails closed.
+private struct AssetSelection: Codable, Equatable {
+    let creationLocal: CreationLocal
+    let width: Int
+    let height: Int
+
+    private static var localCalendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar
+    }
+
+    func validate() throws {
+        let local = creationLocal
+        guard (1...9999).contains(local.year), (1...12).contains(local.month),
+              (1...31).contains(local.day), (0...23).contains(local.hour),
+              (0...59).contains(local.minute), width > 0, height > 0,
+              width <= 1_000_000, height <= 1_000_000 else {
+            throw BridgeFailure("사진 선택 정보의 날짜, 시간 또는 픽셀 크기가 유효하지 않습니다.")
+        }
+        let calendar = Self.localCalendar
+        let components = DateComponents(timeZone: calendar.timeZone, year: local.year,
+            month: local.month, day: local.day, hour: local.hour, minute: local.minute)
+        guard let date = calendar.date(from: components),
+              Self.localMinute(date, calendar: calendar) == local else {
+            throw BridgeFailure("사진 선택 정보의 현지 날짜와 시간이 실제 달력에 존재하지 않습니다.")
+        }
+    }
+
+    static func metadata(for asset: PHAsset) -> AssetSelection? {
+        guard let date = asset.creationDate else { return nil }
+        let selection = AssetSelection(creationLocal: localMinute(date, calendar: localCalendar),
+            width: asset.pixelWidth, height: asset.pixelHeight)
+        do {
+            try selection.validate()
+            return selection
+        } catch { return nil }
+    }
+
+    private static func localMinute(_ date: Date, calendar: Calendar) -> CreationLocal {
+        let fields = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        return CreationLocal(year: fields.year ?? 0, month: fields.month ?? 0,
+            day: fields.day ?? 0, hour: fields.hour ?? -1, minute: fields.minute ?? -1)
+    }
 }
 
 private struct BridgeResponse: Codable {
@@ -31,6 +87,7 @@ private struct BridgeResponse: Codable {
     var width: Int?
     var height: Int?
     var restored: Bool?
+    var selection: AssetSelection?
 }
 
 private struct Baseline: Codable {
@@ -143,31 +200,56 @@ actor BridgeWorker {
         }
         let requestedName = filename.precomposedStringWithCanonicalMapping.lowercased()
         let requestedHasExtension = !(filename as NSString).pathExtension.isEmpty
-        let assets = PHAsset.fetchAssets(with: .image, options: nil)
+        try request.selection?.validate()
+        let recoveryIdentitySupplied = request.assetId != nil || request.baselineOriginalSHA256 != nil
+        if recoveryIdentitySupplied {
+            guard request.preserveBaseline == true, let assetID = request.assetId, !assetID.isEmpty,
+                  let hash = request.baselineOriginalSHA256, hash.count == 64,
+                  hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw BridgeFailure("사진 ID로 재검사하려면 초기 원본 SHA-256과 preserveBaseline이 함께 필요합니다.")
+            }
+        }
+        let assets: PHFetchResult<PHAsset>
+        if let assetID = request.assetId {
+            assets = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
+        } else {
+            assets = PHAsset.fetchAssets(with: .image, options: nil)
+        }
         var matches: [PHAsset] = []
         assets.enumerateObjects { asset, _, stop in
+            guard asset.mediaType == .image else { return }
             let resources = PHAssetResource.assetResources(for: asset)
             if resources.contains(where: {
                 guard $0.type == .photo else { return false }
                 let name = requestedHasExtension ? $0.originalFilename : ($0.originalFilename as NSString).deletingPathExtension
                 return name.precomposedStringWithCanonicalMapping.lowercased() == requestedName
             }) {
+                if let selection = request.selection, AssetSelection.metadata(for: asset) != selection { return }
                 matches.append(asset)
                 if matches.count > 1 { stop.pointee = true }
             }
         }
         guard matches.count == 1, let asset = matches.first else {
             throw BridgeFailure(matches.isEmpty
-                ? "허용된 사진에서 파일명을 찾지 못했습니다. 사진 권한과 파일명을 확인하세요."
-                : "같은 원본 파일명의 사진이 여러 장입니다. 사진을 고유하게 식별할 수 없어 중단했습니다.")
+                ? "사진 식별 정보와 일치하는 사진을 찾지 못했습니다. 사진 권한, 파일명, 날짜와 크기를 확인하세요."
+                : "같은 사진 식별 정보에 해당하는 사진이 여러 장입니다. 사진을 고유하게 식별할 수 없어 중단했습니다.")
         }
         let resolvedFilename = try originalFilename(asset)
         let original = try await imageData(asset, version: .original)
         let current = try await imageData(asset, version: .current)
         let originalHash = sha256(original.data)
         let currentHash = sha256(current.data)
+        if recoveryIdentitySupplied {
+            guard let expectedHash = request.baselineOriginalSHA256, expectedHash == originalHash,
+                  let baseline = try loadLedger()[asset.localIdentifier],
+                  baseline.originalFilename == resolvedFilename, baseline.originalSHA256 == expectedHash else {
+                throw BridgeFailure("재검사할 사진의 파일명 또는 원본 해시가 편집 전 초기 기록과 일치하지 않습니다.")
+            }
+        }
         let refreshed = try assetWithID(asset.localIdentifier)
-        guard refreshed.modificationDate == asset.modificationDate else {
+        guard refreshed.modificationDate == asset.modificationDate,
+              refreshed.creationDate == asset.creationDate,
+              refreshed.pixelWidth == asset.pixelWidth, refreshed.pixelHeight == asset.pixelHeight else {
             throw BridgeFailure("검사 중 사진이 변경되었습니다. 새 요청으로 다시 확인하세요.")
         }
         let adjusted = hasAdjustments(refreshed)
@@ -186,6 +268,7 @@ actor BridgeWorker {
             originalSHA256: originalHash, currentSHA256: currentHash)
         response.width = asset.pixelWidth
         response.height = asset.pixelHeight
+        response.selection = AssetSelection.metadata(for: refreshed)
         return response
     }
 

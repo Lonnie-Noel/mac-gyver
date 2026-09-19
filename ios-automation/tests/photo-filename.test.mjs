@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractOriginalFilename } from '../scripts/photo-filename.mjs';
+import { extractOriginalFilename, extractPhotoSelection } from '../scripts/photo-filename.mjs';
 
 const text = (label, extra = {}) => ({ type: 'XCUIElementTypeStaticText', visible: 'true', label, ...extra });
 const state = (...visible) => ({ visible, nodes: visible });
@@ -59,4 +59,33 @@ test('dates, dimensions, custom extensionless names, and unknown extensions halt
     assert.equal(extractOriginalFilename(state(), state(text(value))), null);
   }
   assert.throws(() => extractOriginalFilename(null, state(text('IMG_1234.JPG'))), /states are required/u);
+});
+
+const metadata = (date, resolution = '가로 4032 세로 3024') => state(
+  text('생성일', { name: 'com.apple.photos.infoPanel.dateCreated', value: date }),
+  text('크기', { name: 'com.apple.photos.infoPanel.exif.resolution', value: resolution }),
+);
+
+test('reads creation minute and dimensions only from exact Photos metadata fields', () => {
+  assert.deepEqual(extractPhotoSelection(metadata('2024년 2월 29일 목요일 오후 8:51')), {
+    creationLocal: { year: 2024, month: 2, day: 29, hour: 20, minute: 51 }, width: 4032, height: 3024,
+  });
+  assert.equal(extractPhotoSelection(state(text('2024년 2월 29일 목요일 오후 8:51'), text('가로 4032 세로 3024'))), null);
+  assert.equal(extractPhotoSelection(state()), null);
+});
+
+test('handles Korean midnight and noon without assuming the Mac timezone', () => {
+  assert.equal(extractPhotoSelection(metadata('2024년 1월 1일 오전 12:00')).creationLocal.hour, 0);
+  assert.equal(extractPhotoSelection(metadata('2024년 1월 1일 오후 12:00')).creationLocal.hour, 12);
+});
+
+test('rejects invalid or ambiguous identity metadata instead of weakening the match', () => {
+  for (const date of ['2023년 2월 29일 오후 8:51', '2024년 4월 31일 오후 8:51', '2024년 1월 1일 오후 13:00', '2024년 1월 1일 오전 0:00', '2024년 1월 1일 오후 1:60']) {
+    assert.throws(() => extractPhotoSelection(metadata(date)), /Invalid/u);
+  }
+  assert.throws(() => extractPhotoSelection(metadata('2024년 1월 1일 오후 1:00', '가로 0 세로 3024')), /Invalid/u);
+  assert.throws(() => extractPhotoSelection(metadata('January 1, 2024', '4032 x 3024')), /Unrecognized/u);
+  const duplicated = metadata('2024년 1월 1일 오후 1:00');
+  duplicated.visible.push(duplicated.visible[0]);
+  assert.throws(() => extractPhotoSelection(duplicated), /Ambiguous/u);
 });

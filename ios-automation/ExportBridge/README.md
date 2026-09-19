@@ -1,6 +1,6 @@
 # Photos Export Bridge
 
-Mac의 Appium 자동화에 사진 파일 읽기·JPEG 내보내기·원본 복원 기능을 제공하는 독립 iOS 앱이다. 기존 MacGyver Xcode 프로젝트와 별개다. **시뮬레이터 대상 무서명 빌드만 검증했으며, 실기기 사진 내보내기와 복원은 아직 검증하지 않았다.**
+Mac의 Appium 자동화에 사진 파일 읽기·JPEG 내보내기·원본 복원 기능을 제공하는 독립 iOS 앱이다. 기존 MacGyver Xcode 프로젝트와 별개다. **2026-09-19 실기기 서명 빌드·설치와 한 장의 JPEG 저장·원본 복원을 검증했다.** 같은 asset의 원본/현재 이미지 해시가 실행 전과 일치하고 편집이 없음을 확인했다. 전체 앨범 처리와 강제 중단 후 복구의 실기기 검증은 아직이다.
 
 Xcode에서 `PhotosExportBridge.xcodeproj`를 열어 `PhotosExportBridge` 타깃에 본인 Team과 고유 Bundle Identifier를 지정한다. 앱을 설치하고 화면의 `사진 접근 권한 설정`을 눌러 전체 사진 접근을 허용해야 한다. 제한된 사진 접근은 동명이인 사진을 놓칠 수 있어 처리하지 않는다. 앱이 권한 요청을 자동으로 승인하거나 Mac이 요청할 때 권한 팝업을 자동으로 열지는 않는다.
 
@@ -12,9 +12,15 @@ Mac은 Appium `mobile: pushFile`로 `@설정한번들ID:documents/request.json`�
 {"id":"UUID","action":"inspect","filename":"IMG_1234.HEIC"}
 ```
 
-`inspect`는 확장자를 생략한 `IMG_1234`도 받으며 대소문자와 유니코드 정규화를 적용한다. 전체 사진에서 일치하는 이미지가 반드시 하나여야 한다. 원본 `.photo` 리소스의 파일명을 반환하고, 기존 편집이 없는 사진만 내부 초기 상태 기록에 등록한다. 기존 편집 사진은 `hasAdjustments: true`로 알리므로 Mac이 건너뛰어야 한다.
+`inspect`는 확장자를 생략한 `IMG_1234`도 받으며 대소문자와 유니코드 정규화를 적용한다. 전체 사진에서 일치하는 이미지가 반드시 하나여야 한다. 정보 패널에서 읽은 다음 `selection`을 함께 보내면 기기 현지 Gregorian 촬영 시각(분 단위)과 가로·세로 픽셀 수가 모두 일치하는 후보만 남긴다. 후보가 없거나 여러 장이면 중단하고 조건을 완화하지 않는다. 응답의 `selection`도 요청과 일치해야 한다.
 
-복구용 `inspect` 요청에는 `preserveBaseline: true`를 넣어 기존 초기 해시·내보내기·복원 기록을 유지한다. 일반적인 새 작업의 `inspect`와 구분한다.
+```json
+{"creationLocal":{"year":2024,"month":2,"day":29,"hour":20,"minute":51},"width":4032,"height":3024}
+```
+
+원본 `.photo` 리소스의 파일명을 반환하고, 기존 편집이 없는 사진만 내부 초기 상태 기록에 등록한다. 기존 편집 사진은 `hasAdjustments: true`로 알리므로 Mac이 건너뛰어야 한다.
+
+복구용 `inspect` 요청에는 `preserveBaseline: true`, 기존 `assetId`, `baselineOriginalSHA256`을 함께 넣어 같은 사진을 조회하고 기존 초기 해시·내보내기·복원 기록을 유지한다. asset ID와 해시는 함께 있어야 하며 보조 앱의 초기 기록까지 일치해야 한다. 편집으로 크기가 달라질 수 있으므로 복구 조회에는 초기 `selection`을 보내지 않는다. 일반적인 새 작업의 `inspect`와 구분한다.
 
 ```json
 {

@@ -58,6 +58,37 @@ function dimensions(value) {
     && value.width > 0 && value.height > 0 && value.width <= 200_000 && value.height <= 200_000;
 }
 
+function exactKeys(value, keys) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+// Treat these as Gregorian calendar fields, never as a Date in the Mac's time
+// zone. They come from the iPhone's displayed local date, at minute precision.
+function canonicalSelection(value) {
+  assert(exactKeys(value, ['creationLocal', 'width', 'height']) && dimensions(value),
+    '사진 선택 정보에는 creationLocal과 유효한 width·height가 모두 필요합니다.');
+  const date = value.creationLocal;
+  assert(exactKeys(date, ['year', 'month', 'day', 'hour', 'minute'])
+    && Object.values(date).every(Number.isSafeInteger)
+    && date.year >= 1 && date.year <= 9999 && date.month >= 1 && date.month <= 12
+    && date.day >= 1 && date.day <= 31 && date.hour >= 0 && date.hour <= 23
+    && date.minute >= 0 && date.minute <= 59,
+  '사진의 현지 촬영 시각은 유효한 연·월·일·시·분 정수여야 합니다.');
+  const checked = new Date(0);
+  checked.setUTCFullYear(date.year, date.month - 1, date.day);
+  checked.setUTCHours(date.hour, date.minute, 0, 0);
+  assert(checked.getUTCFullYear() === date.year && checked.getUTCMonth() + 1 === date.month
+    && checked.getUTCDate() === date.day, '존재하지 않는 촬영 날짜입니다.');
+  return { creationLocal: { year: date.year, month: date.month, day: date.day,
+    hour: date.hour, minute: date.minute }, width: value.width, height: value.height };
+}
+
+function validAssetId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 1024
+    && !/[\x00-\x1f]/.test(value);
+}
+
 // Decode the full JPEG to PNG at its original dimensions. A header-only query or
 // tiny resample could accept corrupt pixels or use an embedded preview instead.
 export async function validateJPEGWithSips(filename) {
@@ -237,8 +268,7 @@ export function createExportBridge({ session, bundleId, runDir, mobileCall, time
       fail('HELPER_REJECTED', `사진 내보내기 도우미가 중단했습니다: ${detail || '사유 없음'}`,
         { helperCode, requestId: request.id, action: request.action });
     }
-    assert(typeof response.assetId === 'string' && response.assetId.length > 0 && response.assetId.length <= 1024
-      && !/[\x00-\x1f]/.test(response.assetId), '도우미가 안정적인 사진 ID를 반환하지 않았습니다.');
+    assert(validAssetId(response.assetId), '도우미가 안정적인 사진 ID를 반환하지 않았습니다.');
     validateSourceName(response.originalFilename);
     assert(shaPattern.test(response.originalSHA256 ?? '') && shaPattern.test(response.currentSHA256 ?? ''),
       '원본 및 현재 이미지 SHA-256이 없거나 잘못되었습니다.');
@@ -296,7 +326,22 @@ export function createExportBridge({ session, bundleId, runDir, mobileCall, time
       record.error = { code: error.code || 'BRIDGE_FAILED', message: error.message };
     } finally {
       if (contacted) {
-        try { await call('activateApp', { bundleId: photosBundleId }, Date.now() + Math.min(timeoutMs, 30_000)); }
+        try {
+          const restoreDeadline = Date.now() + Math.min(timeoutMs, 30_000);
+          await call('activateApp', { bundleId: photosBundleId }, restoreDeadline);
+          // activateApp can return while the helper is still in the foreground.
+          // Do not hand control back to the photo workflow until Photos is active.
+          while (true) {
+            const active = await call('activeAppInfo', {}, restoreDeadline);
+            if (active?.bundleId === photosBundleId) break;
+            if (active?.bundleId !== bundleId && active?.bundleId !== 'com.apple.springboard') {
+              fail('PHOTOS_NOT_FOREGROUND', '사진 앱 복귀 중 예상하지 못한 앱이 전면에 있습니다.');
+            }
+            const remaining = restoreDeadline - Date.now();
+            if (remaining <= 0) fail('BRIDGE_TIMEOUT', '제한 시간 안에 사진 앱이 전면으로 돌아오지 않았습니다.');
+            await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, remaining)));
+          }
+        }
         catch (error) {
           record.photosRestoreError = error.message;
           if (!failure) failure = new ExportBridgeError('PHOTOS_REACTIVATE_FAILED',
@@ -320,12 +365,31 @@ export function createExportBridge({ session, bundleId, runDir, mobileCall, time
     return result;
   }
 
-  async function inspect(filename, { preserveBaseline = false } = {}) {
+  async function inspect(filename, { preserveBaseline = false, selection, assetId, baselineOriginalSHA256 } = {}) {
     validateSourceName(filename, true);
     assert(typeof preserveBaseline === 'boolean', '기준 정보 보존 옵션은 true 또는 false여야 합니다.');
-    return transaction('inspect', { filename, ...(preserveBaseline ? { preserveBaseline: true } : {}) }, async (response, request) => {
+    const fields = { filename, ...(preserveBaseline ? { preserveBaseline: true } : {}) };
+    if (selection !== undefined) fields.selection = canonicalSelection(selection);
+    if (assetId !== undefined || baselineOriginalSHA256 !== undefined) {
+      assert(preserveBaseline && validAssetId(assetId) && typeof baselineOriginalSHA256 === 'string'
+        && shaPattern.test(baselineOriginalSHA256),
+        '정확한 사진 복구에는 preserveBaseline:true와 사진 ID·초기 원본 SHA-256이 함께 필요합니다.');
+      Object.assign(fields, { assetId, baselineOriginalSHA256 });
+    }
+    return transaction('inspect', fields, async (response, request) => {
       identity(response, request);
-      return { ...response, requestId: request.id, action: 'inspect' };
+      let responseSelection;
+      if (request.selection !== undefined) {
+        responseSelection = canonicalSelection(response.selection);
+        assert(JSON.stringify(responseSelection) === JSON.stringify(request.selection),
+          '도우미가 확인한 촬영 시각·이미지 크기가 현재 사진 선택 정보와 다릅니다.');
+      }
+      if (request.assetId !== undefined) {
+        assert(response.assetId === request.assetId && response.originalSHA256 === request.baselineOriginalSHA256,
+          '복구 요청의 사진 ID·초기 원본 해시와 도우미 응답이 일치하지 않습니다.');
+      }
+      return { ...response, ...(responseSelection ? { selection: responseSelection } : {}),
+        requestId: request.id, action: 'inspect' };
     });
   }
 

@@ -47,3 +47,30 @@ export function extractOriginalFilename(beforeState, infoState) {
   if (candidates.size > 1) throw new Error('Ambiguous original filename in the photo information panel');
   return candidates.values().next().value ?? null;
 }
+
+// Photos' information panel shows creation time in the device's local time.
+// Send calendar components to the helper; never guess a timezone on the Mac.
+export function extractPhotoSelection(infoState) {
+  const field = (name) => {
+    const matches = visibleNodes(infoState).filter((node) => node.type === 'XCUIElementTypeStaticText' && node.name === name);
+    if (matches.length > 1) throw new Error('Ambiguous photo information metadata');
+    return matches[0]?.value?.normalize('NFC').trim();
+  };
+  const date = field('com.apple.photos.infoPanel.dateCreated');
+  const resolution = field('com.apple.photos.infoPanel.exif.resolution');
+  if (!date || !resolution) return null;
+  const parts = /^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일(?:\s*[월화수목금토일]요일)?\s*(오전|오후)\s*(\d{1,2}):(\d{2})$/u.exec(date);
+  const size = /^가로\s*(\d+)\s*세로\s*(\d+)$/u.exec(resolution);
+  if (!parts || !size) throw new Error('Unrecognized photo creation time or pixel dimensions');
+  const [year, month, day, clockHour, minute] = [parts[1], parts[2], parts[3], parts[5], parts[6]].map(Number);
+  const hour = clockHour % 12 + (parts[4] === '오후' ? 12 : 0);
+  const check = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  if (year < 1000 || month < 1 || month > 12 || day < 1 || clockHour < 1 || clockHour > 12 || minute > 59
+    || check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) {
+    throw new Error('Invalid photo creation time');
+  }
+  const width = Number(size[1]);
+  const height = Number(size[2]);
+  if (![width, height].every((value) => Number.isSafeInteger(value) && value > 0 && value <= 1_000_000)) throw new Error('Invalid photo pixel dimensions');
+  return { creationLocal: { year, month, day, hour, minute }, width, height };
+}

@@ -10,7 +10,8 @@ async function fixture(t) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   const filename = path.join(directory, 'pending.json');
   const baseline = { assetId: 'asset-one', originalFilename: 'IMG_1234.HEIC', originalSHA256: 'a'.repeat(64),
-    currentSHA256: 'b'.repeat(64), hasAdjustments: false };
+    currentSHA256: 'b'.repeat(64), hasAdjustments: false,
+    selection: { creationLocal: { year: 2024, month: 2, day: 29, hour: 13, minute: 45 }, width: 4032, height: 3024 } };
   const params = { runDir: directory, index: 2, total: 25, baseline,
     entry: { outputBase: 'IMG_1234', originalFilename: 'IMG_1234.HEIC' }, bundleId: 'com.example.PhotosExportBridge' };
   const pending = await beginPendingEdit(params, filename);
@@ -36,7 +37,8 @@ test('existing edits cannot begin an automatic save/revert transaction', async (
 function adapter(f, current, events, receipt = { sha256: 'c'.repeat(64) }) {
   return {
     inspect: async (name, options) => { events.push('inspect'); assert.equal(name, f.baseline.originalFilename);
-      assert.deepEqual(options, { preserveBaseline: true }); return current; },
+      assert.deepEqual(options, { preserveBaseline: true, assetId: f.baseline.assetId,
+        baselineOriginalSHA256: f.baseline.originalSHA256 }); return current; },
     findVerifiedExport: async () => { events.push('find'); return null; },
     exportResult: async () => { events.push('export'); return receipt; },
     verifyLocalExport: async () => { events.push('verify'); return receipt; },
@@ -54,6 +56,25 @@ test('recovery exports and verifies before restoring a saved edit', async (t) =>
     } });
   assert.deepEqual(events, ['viewer', 'inspect', 'find', 'export', 'verify', 'revert', 'viewer', 'persist']);
   assert.equal(result.resultSaved, true);
+  assert.equal(await readPendingEdit(f.filename), null);
+});
+
+test('same-name recovery uses exact recorded asset identity without stale original dimensions', async (t) => {
+  const f = await fixture(t);
+  const events = [];
+  const edited = { ...f.baseline, hasAdjustments: true,
+    selection: { ...f.baseline.selection, width: 5000, height: 4000 } };
+  const bridge = adapter(f, edited, events);
+  let optionsSeen;
+  const inspect = bridge.inspect;
+  bridge.inspect = async (name, options) => { optionsSeen = options; return inspect(name, options); };
+  await recoverPendingEdit({ pending: f.pending, filename: f.filename, bridge,
+    verifyViewer: async () => {}, persist: async () => {} });
+  assert.equal(optionsSeen.assetId, 'asset-one');
+  assert.equal(optionsSeen.baselineOriginalSHA256, f.baseline.originalSHA256);
+  assert.equal(Object.hasOwn(optionsSeen, 'selection'), false);
+  assert(events.includes('export'));
+  assert(events.includes('revert'));
   assert.equal(await readPendingEdit(f.filename), null);
 });
 

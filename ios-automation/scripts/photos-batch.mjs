@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { DOMParser } from '@xmldom/xmldom';
 import { getSession, command, mobile, findElements, snapshot, snapshotFiles } from './phone.mjs';
 import { evidencePaths, reserveCapturePaths } from './capture-storage.mjs';
-import { extractOriginalFilename } from './photo-filename.mjs';
+import { extractOriginalFilename, extractPhotoSelection } from './photo-filename.mjs';
 import { createExportBridge, verifyExportReceipt } from './export-bridge.mjs';
 import { beginPendingEdit, updatePendingEdit, finishPendingEdit, pendingEditFile } from './edit-journal.mjs';
 
@@ -257,14 +257,16 @@ async function run(options) {
     }
     return state;
   };
-  const readFilename = async (index) => {
+  const readPhotoInfo = async (index) => {
     const before = await read();
     viewer(before, index);
     let filename;
+    let selection;
     await click('XCUIElementTypeButton', INFO, { visible: false });
     try {
       await poll((state) => {
         filename = extractOriginalFilename(before, state);
+        if (filename && bridge) selection = extractPhotoSelection(state);
         return filename !== null;
       }, 'original filename in Photos information; an unambiguous filename is required', 10_000);
     } finally {
@@ -274,7 +276,7 @@ async function run(options) {
         && extractOriginalFilename(before, state) === null, 'photo viewer after information', 15_000);
       viewer(returned, index);
     }
-    return filename;
+    return { filename, selection };
   };
   try {
     manifest = existsSync(manifestFile) ? JSON.parse(await readFile(manifestFile, 'utf8')) : {
@@ -324,14 +326,14 @@ async function run(options) {
       currentIndex = index;
       const attempt = (oldEntry?.attempt ?? 0) + 1;
       await checkpoint('before-filename');
-      let originalFilename = await readFilename(index);
+      let { filename: originalFilename, selection } = await readPhotoInfo(index);
       const comparableName = (name) => name.normalize('NFC').replace(/\.(heic|heif|jpe?g|png|dng|tiff?|avif)$/iu, '').toLowerCase();
       if (oldEntry?.originalFilename && comparableName(oldEntry.originalFilename) !== comparableName(originalFilename)) {
         throw new Error(`Photo filename changed at index ${index}; refusing to resume a different photo`);
       }
       let baseline;
       if (bridge) {
-        baseline = await bridge.inspect(originalFilename);
+        baseline = await bridge.inspect(originalFilename, selection ? { selection } : {});
         viewer(await read(), index);
         if (oldEntry?.baseline && (baseline.assetId !== oldEntry.baseline.assetId
           || baseline.originalSHA256 !== oldEntry.baseline.originalSHA256)) {

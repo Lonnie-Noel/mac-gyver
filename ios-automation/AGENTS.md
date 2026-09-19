@@ -34,7 +34,7 @@ Appium → XCUITest 드라이버 → Xcode로 서명한 WebDriverAgent(WDA) → 
 - 드래그는 `(201, 437)`에서 `(5, 633)`까지 1,500ms다. 화면 중앙에서 왼쪽 아래 45도로 왼쪽 가장자리 안쪽까지 이동하는 현재 구현을 보존한다.
 - 재생성 요청 뒤 **최소 25초**가 지나야 하며, 동시에 실제 완료 상태(`editAIStatusViewCompleted`, 활성 `Save`, 진행 표시 없음)를 확인해야 한다. 고정 시간 대기만으로 캡처하지 않는다.
 - 캡처 모드는 `Save`/`완료`를 누르지 않고 **취소 → 취소**한다. 사용자가 요청한 JPEG 모드는 `IOS_EXPORT_BUNDLE_ID` 설정으로 켜며, Save/완료 후 실제 JPEG를 검증하고 동일 asset ID를 PhotoKit으로 원본 복원한다. 이 두 모드를 혼동하지 않는다.
-- JPEG 모드는 처음부터 편집이 없는 사진만 처리한다. 기존 편집은 건너뛰고 파일명 중복은 중단한다. 전체 사진 접근 권한은 보조 앱에서 사용자가 설정한다. 같은 이름만 보고 여러 asset 중 하나를 임의로 고르지 않는다.
+- JPEG 모드는 처음부터 편집이 없는 사진만 처리한다. 기존 편집은 건너뛴다. 정보 패널에서 촬영일시(기기 현지 시각, 분 단위)와 픽셀 크기를 읽을 수 있으면 파일명과 함께 정확히 대조한다. 모든 조건에 맞는 사진이 여러 장이면 중단한다. 전체 사진 접근 권한은 보조 앱에서 사용자가 설정한다. 같은 이름만 보고 여러 asset 중 하나를 임의로 고르지 않는다.
 - `artifacts/pending-photo-edit.json`을 실제 저장 전에 남긴다. JPEG 전송·전체 디코딩·크기·해시 검증 전에는 원본으로 복귀하지 않는다. 미복원 기록이 있으면 새 실행을 막고 `npm run photos:recover`로 먼저 복구한다. 복구 전 기록·보조 앱 데이터를 지우지 않는다.
 - 결과 PNG/JPEG는 실행 폴더 바로 아래 `<원래이름>-preview-capture.png`, `-result-capture.png`, `-result.jpg`로 둔다. XML/해시는 `.metadata/`에 둔다. 이름 충돌 시 접미사를 붙이며 기존 파일을 덮어쓰지 않는다. 이전 폴더 방식의 manifest도 검증할 수 있어야 한다.
 - 사진 선택기의 현재 순번과 총수를 검증하고, 이동할 때 정확히 한 장 바뀌는지 확인한다. 사진 수 변경·순번 점프·사진 앱 이탈·예상 밖 경고에서는 중단한다.
@@ -88,7 +88,7 @@ npm run photos:disconnect
 - 구문 검사: `node --check scripts/photos-batch.mjs`, `node --check scripts/run-photos.mjs`, `node --check scripts/phone.mjs`, `node --check scripts/smoke.mjs`, `zsh -n "사진 자동 캡처 시작.command"`, `zsh -n "사진 자동 캡처 중지.command"`.
 - 기존 로컬 XML로 검사: `node scripts/photos-batch.mjs --fixture PATH_TO_SOURCE_XML`. 필요하면 개인정보 없는 합성 XML로 준비/생성 중/완료/경고/잘못된 순번 구분을 검사한다. `parseState`, `buildOrder`는 import해 오프라인 검사할 수 있다.
 - 실제 검증 범위는 연결 스모크 성공과 앨범의 **6장(2~7번), 캡처 12개, 취소 복귀**다. 사용자 요청으로 중단했으므로 **전체 25장 완료**나 **더블클릭 실행 프로그램의 전체 앨범 통합 검증**을 완료했다고 쓰지 않는다.
-- 0.2.0의 정보 패널 파일명 인식·새 저장 방식·보조 앱 JPEG 저장/복원 통합은 아직 실기기 미검증이다. 기존 6장 결과를 새 기능의 검증으로 쓰지 않는다.
+- 0.2.1은 실기기 한 장의 정보 패널 파일명·촬영일시·크기 식별, 평면 PNG 2개/JPEG 1개 저장, 같은 asset의 원본 복원까지 확인했다. JPEG 전체 디코딩·크기·해시와 복원 후 원본/현재 해시 일치, 편집 없음, 사진 뷰어 복귀, 미완료 기록 없음을 검증했다. 오프라인 테스트는 67개다. 전체 앨범 JPEG 처리 및 강제 중단 후 실기기 복구는 아직이며 기존 6장 캡처 결과와 구분해서 보고한다.
 - 배포물은 소스, 문서, 실행 파일, `package.json`, `package-lock.json`, 빈 `.env.example` 등 필요한 파일만 포함한다. Git 제외 규칙만 믿지 말고 압축 파일 목록을 직접 검사한다.
 - `node scripts/package-release.mjs --check`는 배포 파일만 검사하고, `npm run release:zip`은 `dist/`에 ZIP과 SHA-256을 생성한다. 기기 연결은 하지 않는다. 공개 npm 의존성 연락처를 제외한 민감정보 패턴을 검사하지만 수동 내용 검토를 대체하지 않는다.
 - `.env`, 실제 UDID·Team ID·계정 이메일, 서명 인증서·개인키·프로비저닝 프로파일, `node_modules/`, `DerivedData/`, `.appium/`, `artifacts/`, `logs/`와 캡처·UI XML·세션 정보를 배포하지 않는다.

@@ -15,6 +15,7 @@ const originalSHA256 = 'a'.repeat(64);
 const initialCurrentSHA256 = 'b'.repeat(64);
 const renderedCurrentSHA256 = 'c'.repeat(64);
 const imageDimensions = { width: 4032, height: 3024 };
+const selection = { creationLocal: { year: 2024, month: 2, day: 29, hour: 13, minute: 45 }, ...imageDimensions };
 
 async function fixture(t, options = {}) {
   const folder = await realpath(await mkdtemp(path.join(os.tmpdir(), 'photos-export-test-')));
@@ -23,6 +24,7 @@ async function fixture(t, options = {}) {
   const requests = [];
   let current;
   let responsePulls = 0;
+  let activeAppPolls = 0;
   const mobileCall = async (session, command, args) => {
     assert.equal(session, 'test-session');
     calls.push({ command, args });
@@ -37,6 +39,12 @@ async function fixture(t, options = {}) {
       else assert.equal(args.bundleId, 'test.photos.helper');
       return null;
     }
+    if (command === 'activeAppInfo') {
+      assert.deepEqual(args, {});
+      activeAppPolls++;
+      return options.activeAppInfo ? options.activeAppInfo(current, activeAppPolls)
+        : { bundleId: 'com.apple.mobileslideshow' };
+    }
     assert.equal(command, 'pullFile');
     if (args.remotePath.endsWith('-response.json')) {
       responsePulls++;
@@ -44,6 +52,7 @@ async function fixture(t, options = {}) {
       let response = {
         id: current.id, ok: true, assetId: 'test-asset/L0/001', originalFilename: 'IMG_1234.HEIC',
         originalSHA256, currentSHA256: initialCurrentSHA256, hasAdjustments: false,
+        ...(current.selection ? { selection: current.selection } : {}),
       };
       if (current.action === 'export') Object.assign(response, {
         currentSHA256: renderedCurrentSHA256, hasAdjustments: true,
@@ -65,8 +74,47 @@ async function fixture(t, options = {}) {
 }
 
 function returnedToPhotos(calls) {
-  assert.deepEqual(calls.at(-1), { command: 'activateApp', args: { bundleId: 'com.apple.mobileslideshow' } });
+  assert.deepEqual(calls.at(-1), { command: 'activeAppInfo', args: {} });
+  assert.deepEqual(calls.findLast((call) => call.command === 'activateApp'),
+    { command: 'activateApp', args: { bundleId: 'com.apple.mobileslideshow' } });
 }
+
+test('return to Photos waits through the helper and SpringBoard after one activation', async (t) => {
+  const states = ['test.photos.helper', 'com.apple.springboard', 'com.apple.mobileslideshow'];
+  const { bridge, calls, requests } = await fixture(t, {
+    activeAppInfo: (_, count) => ({ bundleId: states[count - 1] }),
+  });
+  const result = await bridge.inspect('IMG_1234');
+  assert.equal(result.ok, true);
+  const activationIndex = calls.findIndex((call) => call.command === 'activateApp'
+    && call.args.bundleId === 'com.apple.mobileslideshow');
+  assert.deepEqual(calls.slice(activationIndex).map((call) => call.command),
+    ['activateApp', 'activeAppInfo', 'activeAppInfo', 'activeAppInfo']);
+  assert.equal(requests.length, 1);
+  returnedToPhotos(calls);
+});
+
+test('Photos foreground timeout, unexpected app and active-app errors cannot return successful results', async (t) => {
+  const cases = [
+    { activeAppInfo: () => ({ bundleId: 'test.photos.helper' }), cause: 'BRIDGE_TIMEOUT' },
+    { activeAppInfo: () => ({ bundleId: 'com.apple.mobilesafari' }), cause: 'PHOTOS_NOT_FOREGROUND' },
+    { activeAppInfo: () => { throw new Error('active app connection lost'); }, cause: 'active app connection lost' },
+  ];
+  for (const variant of cases) {
+    const { bridge, calls, requests } = await fixture(t, { ...variant, timeoutMs: 30 });
+    await assert.rejects(bridge.inspect('IMG_1234'), (error) => {
+      assert.equal(error.code, 'PHOTOS_REACTIVATE_FAILED');
+      assert.equal(error.cause.code ?? error.cause.message, variant.cause);
+      return true;
+    });
+    assert.equal(calls.filter((call) => call.command === 'activateApp'
+      && call.args.bundleId === 'com.apple.mobileslideshow').length, 1);
+    assert.equal(requests.length, 1);
+    if (variant.cause !== 'BRIDGE_TIMEOUT') {
+      assert.equal(calls.filter((call) => call.command === 'activeAppInfo').length, 1);
+    }
+  }
+});
 
 test('inspect resolves original filename; export saves original-name JPEG and immediate durable receipt; revert binds verified SHA', async (t) => {
   const setup = await fixture(t, { onPhotosActivate: async (request, folder) => {
@@ -112,6 +160,94 @@ test('recovery inspect explicitly preserves helper baseline and rejects non-bool
   assert.equal('preserveBaseline' in requests[1], false);
   await assert.rejects(bridge.inspect('IMG_1234', { preserveBaseline: 'true' }), { code: 'PROTOCOL_INVALID' });
   assert.equal(requests.length, 2);
+});
+
+test('inspect forwards complete selection hints and accepts canonical values regardless of key order', async (t) => {
+  const reordered = { height: 3024, width: 4032,
+    creationLocal: { minute: 45, hour: 13, day: 29, month: 2, year: 2024 } };
+  const { bridge, requests } = await fixture(t, {
+    response: (_, response) => ({ ...response, selection: reordered }),
+  });
+  const baseline = await bridge.inspect('IMG_1234', { selection: reordered });
+  assert.deepEqual(requests[0].selection, selection);
+  assert.deepEqual(baseline.selection, selection);
+  assert.equal(requests.length, 1);
+});
+
+test('invalid selection shapes, calendar dates, ranges and dimensions fail before any device call', async (t) => {
+  const { bridge, calls } = await fixture(t);
+  const withDate = (patch) => ({ ...selection, creationLocal: { ...selection.creationLocal, ...patch } });
+  const invalid = [null, [], {}, { ...selection, extra: true },
+    { ...selection, creationLocal: null }, { ...selection, creationLocal: {} },
+    withDate({ year: 0 }), withDate({ year: 10000 }), withDate({ year: '2024' }),
+    withDate({ month: 0 }), withDate({ month: 13 }), withDate({ day: 0 }), withDate({ day: 32 }),
+    withDate({ year: 2023 }), withDate({ year: 1900 }), withDate({ year: 2100 }),
+    withDate({ month: 4, day: 31 }), withDate({ hour: -1 }), withDate({ hour: 24 }),
+    withDate({ minute: -1 }), withDate({ minute: 60 }), withDate({ minute: 1.5 }),
+    withDate({ minute: NaN }), withDate({ minute: Infinity }), withDate({ second: 0 }),
+    { ...selection, width: 0 }, { ...selection, width: 200001 }, { ...selection, height: -1 },
+    { ...selection, width: '4032' }, { ...selection, height: 1.5 },
+  ];
+  for (const value of invalid) {
+    await assert.rejects(bridge.inspect('IMG_1234', { selection: value }), { code: 'PROTOCOL_INVALID' });
+  }
+  assert.equal(calls.length, 0);
+  assert.deepEqual((await bridge.inspect('IMG_1234', { selection: withDate({ year: 2000 }) })).selection,
+    withDate({ year: 2000 }));
+});
+
+test('missing, partial, different or extra helper selection fields never fall back to filename-only matching', async (t) => {
+  const variants = [undefined, {}, { ...selection, width: 1206 },
+    { ...selection, creationLocal: { ...selection.creationLocal, minute: 46 } },
+    { ...selection, creationLocal: { ...selection.creationLocal, year: 2023 } },
+    { ...selection, timezone: 'Asia/Seoul' }];
+  for (const value of variants) {
+    const { bridge, calls, requests } = await fixture(t, {
+      response: (_, response) => ({ ...response, selection: value }),
+    });
+    await assert.rejects(bridge.inspect('IMG_1234', { selection }), { code: 'PROTOCOL_INVALID' });
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].selection, selection);
+    returnedToPhotos(calls);
+  }
+});
+
+test('recovery inspect binds exact asset ID and original hash while preserving baseline', async (t) => {
+  const { bridge, requests } = await fixture(t);
+  const options = { preserveBaseline: true, assetId: 'test-asset/L0/001', baselineOriginalSHA256: originalSHA256 };
+  const current = await bridge.inspect('IMG_1234.HEIC', options);
+  assert.equal(current.assetId, options.assetId);
+  assert.equal(current.originalSHA256, options.baselineOriginalSHA256);
+  assert.deepEqual({ ...requests[0], id: undefined },
+    { id: undefined, action: 'inspect', filename: 'IMG_1234.HEIC', ...options });
+  assert.equal('selection' in requests[0], false);
+});
+
+test('recovery asset ID and hash require each other and preserveBaseline before any device call', async (t) => {
+  const { bridge, calls } = await fixture(t);
+  const valid = { preserveBaseline: true, assetId: 'test-asset/L0/001', baselineOriginalSHA256: originalSHA256 };
+  for (const options of [
+    { assetId: valid.assetId }, { baselineOriginalSHA256: originalSHA256 },
+    { ...valid, preserveBaseline: false }, { ...valid, assetId: undefined },
+    { ...valid, baselineOriginalSHA256: undefined }, { ...valid, assetId: null },
+    { ...valid, assetId: '' }, { ...valid, assetId: 'bad\nasset' },
+    { ...valid, assetId: 'a'.repeat(1025) }, { ...valid, baselineOriginalSHA256: 'A'.repeat(64) },
+    { ...valid, baselineOriginalSHA256: 'invalid' }, { ...valid, baselineOriginalSHA256: [originalSHA256] },
+  ]) await assert.rejects(bridge.inspect('IMG_1234', options), { code: 'PROTOCOL_INVALID' });
+  assert.equal(calls.length, 0);
+});
+
+test('exact recovery never accepts another same-name asset or changed original hash', async (t) => {
+  for (const change of [{ assetId: 'same-name-other-asset' }, { originalSHA256: 'd'.repeat(64) },
+    { originalFilename: 'IMG_9999.HEIC' }]) {
+    const { bridge, calls, requests } = await fixture(t, {
+      response: (_, response) => ({ ...response, ...change }),
+    });
+    await assert.rejects(bridge.inspect('IMG_1234', { preserveBaseline: true,
+      assetId: 'test-asset/L0/001', baselineOriginalSHA256: originalSHA256 }), { code: 'PROTOCOL_INVALID' });
+    assert.equal(requests.length, 1);
+    returnedToPhotos(calls);
+  }
 });
 
 test('camera suffix stems and NFC/case-normalized source filenames match the helper', async (t) => {
