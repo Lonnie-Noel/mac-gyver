@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {
   selectors, uniqueNode, sameRect, readUI, photoFrame, dragGeometry,
-  rotateItems, outputStem, verifyIdentity, validateConfig,
+  rotateItems, outputStem, verifyIdentity, validateConfig, reframePose,
 } from '../scripts/core.mjs';
 
 const rect = { x: 100, y: 50, width: 1200, height: 900 };
@@ -12,6 +12,15 @@ const snapshot = (nodes = [], windowRect = rect) => ({
 });
 const node = (selector, enabled = true, extra = {}) => ({ ...selector, enabled, ...extra });
 const canvas = frame => node({ identifier: 'IPXCanvasItemView', role: 'AXGroup' }, false, { rect: frame });
+const poseNodes = (values = [0, 0, 0, 0, 0, 1.15], parent = 'window/sidebar/controls') => {
+  let slider = 0;
+  return [{ role: 'AXScrollArea', path: parent }, ...[
+    ['AXButton', '회전'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '패닝'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '수평 맞추기'], ['AXSlider', ''], ['AXButton', '확대/축소'], ['AXSlider', ''],
+  ].map(([role, description], index) => ({ role, description, enabled: true, parent, path: `${parent}/${index}`,
+    ...(role === 'AXSlider' ? { value: values[slider++] } : {}) }))];
+};
 const closeTo = (actual, expected, tolerance = 1e-8) => assert.ok(Math.abs(actual - expected) <= tolerance,
   `expected ${actual} to be within ${tolerance} of ${expected}`);
 
@@ -107,15 +116,91 @@ test('enabled Save is generated only after all busy indicators disappear', () =>
 });
 
 test('ready Reframe instructions and enabled apply button distinguish pre-drag and post-drag', () => {
-  const controls = [node(selectors.cancel), node(selectors.save, false)];
-  const ready = readUI(snapshot([...controls, node(selectors.reframe, false),
+  const controls = [node(selectors.cancel), node(selectors.save, false), node(selectors.resetReframe, false), ...poseNodes()];
+  const generateButton = { role: 'AXButton', description: '프레임 재설정' };
+  const ready = readUI(snapshot([...controls, node(generateButton, false),
     { role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' }]));
   assert.equal(ready.reframeReady, true);
   assert.equal(ready.dragged, false);
   assert.equal(ready.generated, false);
-  const dragged = readUI(snapshot([...controls, node(selectors.reframe)]));
+  const dragged = readUI(snapshot([...controls, node(generateButton)]));
   assert.equal(dragged.dragged, true);
   assert.equal(dragged.generated, false);
+});
+
+test('Reframe pose reads six ordered slider values from one unambiguous sidebar group', () => {
+  const expected = [-12, 6.5, 0.25, -0.3, 1, 1.15];
+  const nodes = poseNodes(expected);
+  assert.deepEqual(reframePose(snapshot(nodes)), expected);
+  assert.deepEqual(reframePose(snapshot([...nodes].reverse())), expected, 'tree array order does not assign axes');
+  assert.deepEqual(reframePose(snapshot([...nodes, { role: 'AXSlider', value: 500, parent: 'window/other', path: 'window/other/0' }])), expected);
+});
+
+test('Reframe pose rejects missing, duplicated, disabled, nonnumeric or wrongly grouped controls', () => {
+  for (const mutate of [
+    nodes => nodes.splice(2, 1),
+    nodes => nodes.push({ ...nodes[2] }),
+    nodes => { nodes[2].enabled = false; },
+    nodes => { nodes[2].value = '0'; },
+    nodes => { nodes[2].value = NaN; },
+    nodes => { nodes[2].value = Infinity; },
+    nodes => { delete nodes[2].value; },
+    nodes => { nodes[2].description = '가로'; },
+    nodes => { nodes[2].parent = 'window/other'; },
+    nodes => { nodes[2].path = nodes[3].path; },
+    nodes => { nodes[2].path += '/0'; },
+    nodes => { nodes[0].role = 'AXGroup'; },
+    nodes => { nodes[4].parent = 'window/other'; },
+    nodes => nodes.push(...poseNodes([0, 0, 0, 0, 0, 1], 'window/other/controls')),
+  ]) {
+    const nodes = poseNodes(); mutate(nodes);
+    assert.equal(reframePose(snapshot(nodes)), null, mutate.toString());
+  }
+  assert.equal(reframePose({ ...snapshot(poseNodes()), truncated: true }), null);
+  assert.equal(reframePose(null), null);
+});
+
+test('neutral Reframe is ready without instructional text, but cached pose or uncertain controls cannot start a drag', () => {
+  const readyNodes = [node(selectors.cancel), node(selectors.save, false),
+    node(selectors.resetReframe, false), node(selectors.generateReframe), ...poseNodes()];
+  const ready = readUI(snapshot(readyNodes));
+  assert.equal(ready.reframeReady, true);
+  assert.deepEqual(ready.pose, [0, 0, 0, 0, 0, 1.15]);
+  assert.equal(ready.resettable, false);
+  for (const mutate of [
+    nodes => { nodes.find(n => n.role === 'AXSlider').value = 5; },
+    nodes => { nodes.filter(n => n.role === 'AXSlider').at(-1).value = 0; },
+    nodes => { nodes.find(n => n.description === '재설정').enabled = true; },
+    nodes => { nodes.find(n => n.identifier === selectors.save.identifier).enabled = true; },
+    nodes => { delete nodes.find(n => n.description === '재설정').enabled; },
+    nodes => nodes.push(node(selectors.resetReframe, false)),
+    nodes => nodes.push({ role: 'AXProgressIndicator' }),
+  ]) {
+    const nodes = structuredClone(readyNodes); mutate(nodes);
+    nodes.push({ role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' });
+    assert.equal(readUI(snapshot(nodes)).reframeReady, false, mutate.toString());
+  }
+  const cached = readUI(snapshot([node(selectors.cancel), node(selectors.save, false), node(selectors.resetReframe),
+    node(selectors.generateReframe), ...poseNodes([-12, 6.5, 0, 0, 0, 1.15])]));
+  assert.equal(cached.reframeReady, false);
+  assert.equal(cached.resettable, true);
+});
+
+test('the modal generation button uses AXDescription while the Tools entry uses AXTitle', () => {
+  // These literal node shapes come from the two distinct live Photos controls;
+  // deriving both fixtures from the production selector would hide this regression.
+  const entry = node({ role: 'AXButton', title: '프레임 재설정' });
+  const generate = node({ role: 'AXButton', description: '프레임 재설정' });
+  assert.equal(uniqueNode(snapshot([entry, generate]), selectors.reframe), entry);
+  assert.equal(uniqueNode(snapshot([entry, generate]), selectors.generateReframe), generate);
+  const controls = [node(selectors.cancel), node(selectors.save, false)];
+  assert.equal(readUI(snapshot([...controls, generate])).dragged, true);
+  assert.equal(readUI(snapshot([...controls, entry])).dragged, false,
+    'a title-only entry button cannot stand in for the modal generation control');
+  assert.equal(readUI(snapshot([...controls, entry, { ...generate, enabled: false }])).dragged, false,
+    'an enabled title-only button cannot override a disabled generation control');
+  assert.equal(readUI(snapshot([...controls, { ...generate, role: 'AXStaticText' }])).dragged, false);
+  assert.equal(readUI(snapshot([...controls, generate, { role: 'AXProgressIndicator' }])).dragged, false);
 });
 
 test('viewer/editor states use enabled controls rather than disabled menu text', () => {

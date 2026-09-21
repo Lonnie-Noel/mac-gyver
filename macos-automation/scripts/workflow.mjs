@@ -32,9 +32,21 @@ export class PhotoWorkflow {
     throw new Error(`대기 시간초과: ${description}`);
   }
   async ui() {
-    this.checkStop(); const snapshot = await this.bridge.call('snapshot'); const state = readUI(snapshot);
-    if (!snapshot.frontmost || state.alert) throw new Error('사진 앱이 전면이 아니거나 예상 밖 대화상자가 열렸습니다.');
-    return state;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      this.checkStop();
+      let snapshot;
+      try { snapshot = await this.bridge.call('snapshot'); }
+      catch (error) {
+        // An animation can remove an AX element while its attributes are read.
+        // Discard that partial read and request a fresh tree; never replay input.
+        if (attempt === 2 || !/^AX_READ_FAILED: AX[A-Za-z]+ 조회 실패: -25202$/.test(error.message)) throw error;
+        await this.pause(Math.min(this.config.pollIntervalMs, 250));
+        continue;
+      }
+      const state = readUI(snapshot);
+      if (!snapshot.frontmost || state.alert) throw new Error('사진 앱이 전면이 아니거나 예상 밖 대화상자가 열렸습니다.');
+      return state;
+    }
   }
   async selected(item) {
     const { items } = await this.bridge.call('selection');
@@ -58,13 +70,20 @@ export class PhotoWorkflow {
     this.checkStop(); return this.bridge.call('press', { selector: { ...selector, enabled: true }, expectedWindow: expectedWindow ?? state.snapshot.window.rect });
   }
   async enterEditor(item) {
+    return this.editorTransition(item, selectors.edit, 'viewer', 'editing', '같은 사진의 편집 화면');
+  }
+  async leaveEditor(item, expectedWindow) {
+    return this.editorTransition(item, selectors.done, 'editing', 'viewer', '같은 사진의 보기 화면', expectedWindow);
+  }
+  async editorTransition(item, selector, from, to, description, expectedWindow) {
     const before = await this.ui();
-    if (!before.viewer || !await this.selected(item)) throw new Error('편집 전에 선택한 사진이 바뀌었습니다.');
+    if (!before[from] || !await this.selected(item)) throw new Error('편집 화면 전환 전에 선택한 사진 또는 화면이 바뀌었습니다.');
+    if (expectedWindow && !sameRect(before.snapshot.window.rect, expectedWindow)) throw new Error('사진 창 위치나 크기가 바뀌었습니다.');
     let pressError;
-    try { await this.press(selectors.edit, before.snapshot.window.rect); }
+    try { await this.press(selector, before.snapshot.window.rect); }
     catch (error) {
-      // Photos can open its editor yet report attributeUnsupported from AXPress.
-      // This observed Edit-only case is ambiguous: inspect, never press again.
+      // Photos can open/close its editor yet report attributeUnsupported from AXPress.
+      // Only these observed Edit/Done cases use this path: inspect, never press again.
       if (error.message !== 'AX_PRESS_FAILED: AXPress 실패: -25205') throw error;
       pressError = error;
     }
@@ -73,14 +92,14 @@ export class PhotoWorkflow {
         const after = await this.ui();
         if (after.snapshot.appPid !== before.snapshot.appPid || !sameRect(after.snapshot.window.rect, before.snapshot.window.rect)) throw new Error('편집 화면 확인 중 사진 앱이나 창이 바뀌었습니다.');
         if (!await this.selected(item)) throw new Error('편집 화면 확인 중 선택한 사진이 바뀌었습니다.');
-        return after.editing && !after.viewer && !after.modal;
-      }, '같은 사진의 편집 화면', pressError ? 5_000 : 30_000);
+        return after[to] && !after[from] && !after.modal;
+      }, description, pressError ? 5_000 : 30_000);
     } catch (error) {
       if (pressError) throw new Error(`${pressError.message}; 화면 전환을 확인하지 못했습니다: ${error.message}`, { cause: error });
       throw error;
     }
     if (pressError) {
-      this.log('편집 버튼이 오류를 반환했지만 같은 사진의 편집 화면 전환을 확인했습니다. 버튼을 다시 누르지 않습니다.');
+      this.log(`${from === 'viewer' ? '편집' : '완료'} 버튼이 오류를 반환했지만 ${description} 전환을 확인했습니다. 버튼을 다시 누르지 않습니다.`);
       return { pressError: pressError.message, assetId: item.id, appPid: before.snapshot.appPid,
         window: before.snapshot.window.rect, confirmedAt: new Date(this.now()).toISOString() };
     }
@@ -142,16 +161,27 @@ export class PhotoWorkflow {
     if (editConfirmation) await this.update(record, { editConfirmation });
     await this.press(selectors.tools); await this.poll(async () => (await this.ui()).tools, '도구 화면');
     await this.press(selectors.reframe);
-    const prepared = await this.poll(async () => { const s=await this.ui(); return s.reframeReady ? s : false; }, '프레임 재설정 준비', this.config.generationTimeoutSeconds * 1000);
+    let prepared = await this.poll(async () => { const s=await this.ui(); return s.reframeReady || s.resettable ? s : false; }, '프레임 재설정 준비', this.config.generationTimeoutSeconds * 1000);
+    if (prepared.resettable) {
+      if (!await this.selected(item)) throw new Error('구도 초기화 전에 선택한 사진이 바뀌었습니다.');
+      this.log('드래그 전에 구도를 기본값으로 초기화합니다.');
+      await this.press(selectors.resetReframe, prepared.snapshot.window.rect);
+      prepared = await this.poll(async () => { const s=await this.ui(); return s.reframeReady ? s : false; }, '기본 구도 초기화');
+    }
+    if (!Array.isArray(prepared.pose) || prepared.pose.length !== 6 || !prepared.pose.every(Number.isFinite)) throw new Error('드래그 전 프레임 구도 수치를 확인하지 못했습니다.');
     const expectedWindow = prepared.snapshot.window.rect;
     const frame = photoFrame(prepared.snapshot, baseline.width, baseline.height);
     const geometry = dragGeometry(frame, this.config.dragRadiusFactor);
-    await this.update(record, { drag: { ...geometry, durationMs: this.config.dragDurationMs }, expectedWindow });
+    await this.update(record, { drag: { ...geometry, durationMs: this.config.dragDurationMs }, expectedWindow, poseBeforeDrag: prepared.pose });
     this.checkStop(); await this.bridge.call('drag', { ...geometry, durationMs: this.config.dragDurationMs, expectedWindow });
-    await this.poll(async () => (await this.ui()).dragged, '구도 변경 후 프레임 재설정 버튼');
+    const dragged = await this.poll(async () => {
+      const s = await this.ui();
+      return s.dragged && s.pose?.some((value, index) => index < 5 && Math.abs(value - prepared.pose[index]) > 1e-6) ? s : false;
+    }, '실제 구도 변경 및 프레임 재설정 버튼');
+    await this.update(record, { poseAfterDrag: dragged.pose });
     const preview = await this.capture(outputs.preview, expectedWindow);
     await this.update(record, { phase: 'preview', preview });
-    await this.press(selectors.reframe, expectedWindow);
+    await this.press(selectors.generateReframe, expectedWindow);
     const generationStarted = this.now();
     await this.update(record, { phase: 'generating', generationStartedAt: new Date(generationStarted).toISOString() });
     this.log('프레임 재생성 중…');
@@ -163,7 +193,10 @@ export class PhotoWorkflow {
     if (!(await this.ui()).generated || !await this.selected(item)) throw new Error('저장 전에 사진 또는 생성 결과가 바뀌었습니다.');
     await this.press(selectors.save, expectedWindow);
     const applied = await this.poll(async () => { const s=await this.ui(); return s.viewer || s.editing ? s : false; }, '생성 결과 적용');
-    if (applied.editing) await this.press(selectors.done);
+    if (applied.editing) {
+      const doneConfirmation = await this.leaveEditor(item, expectedWindow);
+      if (doneConfirmation) await this.update(record, { doneConfirmation });
+    }
     await this.poll(async () => (await this.ui()).viewer && await this.selected(item), '변경사항 저장 완료');
     await this.update(record, { phase: 'saved' });
     await this.poll(async () => {
@@ -197,7 +230,8 @@ export class PhotoWorkflow {
         // PhotoKit must still match the state observed before this UI cleanup.
         const check=await this.bridge.call('inspect',{...this.identity(record.baseline),preserveBaseline:true});
         if(check.currentSHA256!==current.currentSHA256 || check.hasAdjustments!==current.hasAdjustments)throw new Error('편집 정리 도중 사진이 변경됐습니다.');
-        await this.press(selectors.done);
+        const recoveryDoneConfirmation = await this.leaveEditor(record.item);
+        if (recoveryDoneConfirmation) await this.update(record, { recoveryDoneConfirmation });
       }
     }
     await this.show(record.item);

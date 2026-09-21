@@ -4,6 +4,8 @@ export const selectors = Object.freeze({
   edit: { identifier: 'IPXToolbarItemIDToggleEdit' },
   tools: { role: 'AXRadioButton', description: '도구' },
   reframe: { role: 'AXButton', title: '프레임 재설정' },
+  generateReframe: { role: 'AXButton', description: '프레임 재설정' },
+  resetReframe: { role: 'AXButton', description: '재설정' },
   save: { identifier: 'IPXEditModalSaveChanges' },
   cancel: { identifier: 'IPXEditModalCancelChanges' },
   done: { identifier: 'IPXToolbarItemIDToggleDoneEdit' },
@@ -18,6 +20,36 @@ export function validRect(rect) {
   return rect && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(rect[key])) && rect.width > 0 && rect.height > 0;
 }
 export function sameRect(a, b) { return validRect(a) && validRect(b) && ['x','y','width','height'].every(key => Math.abs(a[key] - b[key]) <= 1); }
+export function reframePose(snapshot) {
+  if (!snapshot || snapshot.truncated || !Array.isArray(snapshot.nodes)) return null;
+  const labels = ['회전', '패닝', '수평 맞추기', '확대/축소'];
+  const groups = labels.map(description => snapshot.nodes.filter(n => n.role === 'AXButton' && n.description === description && n.enabled === true));
+  if (groups.some(nodes => nodes.length !== 1)) return null;
+  const parent = groups[0][0].parent;
+  if (typeof parent !== 'string' || !parent.startsWith('window/') || groups.some(([node]) => node.parent !== parent)) return null;
+  const containers = snapshot.nodes.filter(node => node.path === parent);
+  if (containers.length !== 1 || containers[0].role !== 'AXScrollArea') return null;
+  const children = snapshot.nodes.filter(node => node.parent === parent);
+  if (children.length !== 10) return null;
+  const index = node => {
+    if (typeof node.path !== 'string' || !node.path.startsWith(`${parent}/`)) return NaN;
+    const suffix = node.path.slice(parent.length + 1);
+    return /^(0|[1-9][0-9]*)$/.test(suffix) ? Number(suffix) : NaN;
+  };
+  const indices = children.map(index);
+  if (indices.some(value => !Number.isSafeInteger(value)) || new Set(indices).size !== children.length) return null;
+  children.sort((a, b) => index(a) - index(b));
+  const shape = [
+    ['AXButton', '회전'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '패닝'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '수평 맞추기'], ['AXSlider', ''],
+    ['AXButton', '확대/축소'], ['AXSlider', ''],
+  ];
+  if (children.some((node, i) => node.enabled !== true || node.role !== shape[i][0]
+    || (node.description ?? '') !== shape[i][1]
+    || (node.role === 'AXSlider' && !Number.isFinite(node.value)))) return null;
+  return children.filter(node => node.role === 'AXSlider').map(node => node.value);
+}
 export function readUI(snapshot) {
   if (!snapshot || snapshot.truncated || !Array.isArray(snapshot.nodes) || !validRect(snapshot.window?.rect)) throw new Error('완전한 사진 앱 UI 정보가 필요합니다.');
   const has = selector => snapshot.nodes.some(node => matches(node, selector) && node.enabled === true);
@@ -25,10 +57,20 @@ export function readUI(snapshot) {
   const modal = snapshot.nodes.some(node => matches(node, selectors.cancel));
   const busy = snapshot.nodes.some(n => n.role === 'AXProgressIndicator') || /준비 중|생성 중|처리 중|재생성 중/.test(text);
   const alert = snapshot.nodes.some(n => n.role === 'AXSheet' || n.subrole === 'AXDialog' || n.subrole === 'AXSystemDialog');
+  const uniqueEnabled = (selector, enabled) => {
+    const nodes = snapshot.nodes.filter(node => matches(node, selector));
+    return nodes.length === 1 && nodes[0].enabled === enabled;
+  };
+  const pose = reframePose(snapshot);
+  const neutral = pose !== null && pose.slice(0, 5).every(value => Math.abs(value) <= 1e-6) && pose[5] > 0;
+  const ready = neutral && uniqueEnabled(selectors.save, false) && uniqueEnabled(selectors.resetReframe, false)
+    && (uniqueEnabled(selectors.generateReframe, true)
+      || (uniqueEnabled(selectors.generateReframe, false) && /드래그하여 시점|드래그.*조절/.test(text)));
   return { snapshot, text, modal, busy, alert, viewer: has(selectors.edit) && !modal && !has(selectors.done),
     editing: has(selectors.done) && !modal, tools: has(selectors.reframe) && !modal,
-    reframeReady: modal && !busy && /드래그하여 시점|드래그.*조절/.test(text),
-    dragged: modal && !busy && has(selectors.reframe),
+    pose, resettable: modal && !busy && pose !== null && uniqueEnabled(selectors.resetReframe, true),
+    reframeReady: modal && !busy && ready,
+    dragged: modal && !busy && has(selectors.generateReframe),
     generated: modal && !busy && has(selectors.save),
   };
 }

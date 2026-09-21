@@ -19,6 +19,22 @@ const CONFIG = Object.freeze({ minimumGenerationSeconds: 25, generationTimeoutSe
   dragRadiusFactor: 0.5, dragDurationMs: 1500, pollIntervalMs: 1000, albumId: null });
 const sameSelector = (a, b) => Object.entries(b).every(([key, value]) => a[key] === value);
 const control = (selector, enabled = true) => ({ ...selector, enabled });
+// Keep the observed UI attributes independent of production selectors. The Tools
+// entry has AXTitle; the generation control in the modal has AXDescription only.
+const REFRAME_ENTRY = Object.freeze({ role: 'AXButton', title: '프레임 재설정' });
+const REFRAME_GENERATE = Object.freeze({ role: 'AXButton', description: '프레임 재설정' });
+const REFRAME_RESET = Object.freeze({ role: 'AXButton', description: '재설정' });
+const NEUTRAL_POSE = Object.freeze([0, 0, 0, 0, 0, 1.15]);
+const poseControls = values => {
+  const parent = 'window/sidebar/controls';
+  let slider = 0;
+  return [{ role: 'AXScrollArea', path: parent }, ...[
+    ['AXButton', '회전'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '패닝'], ['AXSlider', '세로'], ['AXSlider', '가로'],
+    ['AXButton', '수평 맞추기'], ['AXSlider', ''], ['AXButton', '확대/축소'], ['AXSlider', ''],
+  ].map(([role, description], index) => ({ role, description, enabled: true, parent, path: `${parent}/${index}`,
+    ...(role === 'AXSlider' ? { value: values[slider++] } : {}) }))];
+};
 
 async function fixture(t, options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'macgyver-workflow-test-'));
@@ -29,20 +45,23 @@ async function fixture(t, options = {}) {
   const env = { stage: 'viewer', frontmost: true, selected: { ...ITEM }, edited: !!options.edited,
     clock: Date.UTC(2026, 0, 1), stop: false, calls: [], hook: null, pauseHook: null,
     exportError: null, verifyError: null, exportChanges: null, inspectChanges: null,
-    corruptExport: false, draftApplied: false, snapshotChanges: null, extraNodes: [] };
+    corruptExport: false, draftApplied: false, snapshotChanges: null, extraNodes: [],
+    pose: [...(options.initialPose ?? NEUTRAL_POSE)], hint: options.hint !== false };
   const pending = async () => existsSync(pendingPath) ? JSON.parse(await readFile(pendingPath, 'utf8')) : null;
   const state = () => {
     const nodes = [];
     if (env.stage === 'viewer') nodes.push(control(selectors.edit));
     if (env.stage === 'editing' || env.stage === 'tools' || env.stage === 'applied') nodes.push(control(selectors.done));
     if (env.stage === 'editing') nodes.push(control(selectors.tools));
-    if (env.stage === 'tools') nodes.push(control(selectors.reframe));
+    if (env.stage === 'tools') nodes.push(control(REFRAME_ENTRY));
     if (['ready', 'dragged', 'generated'].includes(env.stage)) {
       nodes.push(control(selectors.cancel), control(selectors.save, env.stage === 'generated'));
-      nodes.push(control(selectors.reframe, env.stage === 'dragged'));
+      nodes.push(control(REFRAME_GENERATE, env.stage === 'dragged' || (env.stage === 'ready' && !env.hint)));
+      nodes.push(control(REFRAME_RESET, env.pose.some((value, index) => Math.abs(value - NEUTRAL_POSE[index]) > 1e-6)));
+      nodes.push(...poseControls(env.pose));
       nodes.push({ identifier: 'IPXCanvasItemView', role: 'AXGroup', enabled: false,
         rect: { x: 200, y: 150, width: 1000, height: 700 } });
-      if (env.stage === 'ready') nodes.push({ role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' });
+      if (env.stage === 'ready' && env.hint) nodes.push({ role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' });
     }
     return { frontmost: env.frontmost, appPid: 123, window: { title: '사진', rect: { ...WINDOW } },
       nodes: [...nodes, ...env.extraNodes], truncated: false, ...env.snapshotChanges };
@@ -66,9 +85,14 @@ async function fixture(t, options = {}) {
         const selector = args.selector;
         if (sameSelector(selector, selectors.edit)) { assert.equal(env.stage, 'viewer'); env.stage = 'editing'; }
         else if (sameSelector(selector, selectors.tools)) { assert.equal(env.stage, 'editing'); env.stage = 'tools'; }
-        else if (sameSelector(selector, selectors.reframe)) {
-          if (env.stage === 'tools') env.stage = 'ready';
-          else { assert.equal(env.stage, 'dragged'); env.stage = 'generated'; env.generationStarted = env.clock; }
+        else if (sameSelector(selector, REFRAME_ENTRY)) {
+          assert.equal(env.stage, 'tools'); env.stage = 'ready';
+        } else if (sameSelector(selector, REFRAME_GENERATE)) {
+          assert.equal(env.stage, 'dragged'); env.stage = 'generated'; env.generationStarted = env.clock;
+        } else if (sameSelector(selector, REFRAME_RESET)) {
+          assert.equal(env.stage, 'ready');
+          if (!options.resetDoesNotChange) env.pose = [...NEUTRAL_POSE];
+          env.hint = false;
         } else if (sameSelector(selector, selectors.save)) {
           assert.equal(env.stage, 'generated');
           assert.equal(call.pending?.phase, 'saving', 'durable pending journal must precede the first Save action');
@@ -88,6 +112,7 @@ async function fixture(t, options = {}) {
       case 'drag':
         assert.equal(env.stage, 'ready');
         assert.ok(args.to.x < args.from.x && args.to.y > args.from.y);
+        if (!options.noPoseChange) env.pose = [-12, 6.5, 0, 0, 0, NEUTRAL_POSE[5]];
         env.stage = 'dragged'; return { dragged: true };
       case 'capture':
         assert.ok(['dragged', 'generated'].includes(env.stage));
@@ -140,6 +165,19 @@ test('one-photo workflow commits Save/Done, verifies JPEG before restoring, then
   assert.ok(index(call => call.action === 'verifyJPEG') < index(call => call.action === 'revert'));
   assert.equal(callsFor(env, 'show').length, 1);
   assert.equal(callsFor(env, 'revert').length, 1);
+  const entryPresses = pressCalls(env, REFRAME_ENTRY);
+  const generationPresses = pressCalls(env, REFRAME_GENERATE);
+  assert.equal(entryPresses.length, 1);
+  assert.equal(generationPresses.length, 1);
+  assert.deepEqual(entryPresses[0].args.selector, { ...REFRAME_ENTRY, enabled: true });
+  assert.deepEqual(generationPresses[0].args.selector, { ...REFRAME_GENERATE, enabled: true });
+  assert.equal(entryPresses[0].stage, 'tools');
+  assert.equal(generationPresses[0].stage, 'dragged');
+  const dragIndex = index(call => call.action === 'drag');
+  const previewIndex = index(call => call.action === 'capture' && call.stage === 'dragged');
+  assert.ok(index(call => call === entryPresses[0]) < dragIndex);
+  assert.ok(dragIndex < previewIndex);
+  assert.ok(previewIndex < index(call => call === generationPresses[0]));
   assert.deepEqual(await readFile(path.join(runDir, 'IMG_4321-result.jpg')), JPEG);
   assert.deepEqual(await readFile(path.join(runDir, 'IMG_4321-preview-capture.png')), PNG);
   const completion = JSON.parse(await readFile(path.join(runDir, '.metadata', 'IMG_4321-result.json'), 'utf8'));
@@ -147,6 +185,51 @@ test('one-photo workflow commits Save/Done, verifies JPEG before restoring, then
 });
 
 const EDIT_PRESS_ERROR = 'AX_PRESS_FAILED: AXPress 실패: -25205';
+
+test('a cached Reframe pose is reset exactly once and verified neutral before a new drag', async t => {
+  const { workflow, env, pending } = await fixture(t, { initialPose: [15, -8, 0, 0, 0, 1.15], hint: false });
+  const result = await workflow.process(ITEM);
+  assert.equal(result.status, 'complete');
+  assert.equal(pressCalls(env, REFRAME_RESET).length, 1);
+  const resetIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, REFRAME_RESET));
+  const dragIndex = env.calls.findIndex(call => call.action === 'drag');
+  assert.ok(resetIndex < dragIndex);
+  assert.ok(env.calls.slice(resetIndex + 1, dragIndex).some(call => call.action === 'snapshot'));
+  assert.deepEqual(callsFor(env, 'drag')[0].pending.poseBeforeDrag, NEUTRAL_POSE);
+  assert.deepEqual(result.poseBeforeDrag, NEUTRAL_POSE);
+  assert.deepEqual(result.poseAfterDrag, [-12, 6.5, 0, 0, 0, 1.15]);
+  assert.deepEqual(callsFor(env, 'capture')[0].pending.poseAfterDrag, result.poseAfterDrag);
+  assert.equal(await pending(), null);
+});
+
+test('a neutral reopened modal works without instructional text and does not reset again', async t => {
+  const { workflow, env } = await fixture(t, { hint: false });
+  assert.equal((await workflow.process(ITEM)).status, 'complete');
+  assert.equal(pressCalls(env, REFRAME_RESET).length, 0);
+  assert.equal(callsFor(env, 'drag').length, 1);
+});
+
+test('an enabled generation button without actual pose change cannot capture or generate a result', async t => {
+  const { workflow, env, pending } = await fixture(t, { noPoseChange: true, hint: false });
+  await assert.rejects(workflow.process(ITEM), /대기 시간초과: 실제 구도 변경/);
+  assert.equal(callsFor(env, 'drag').length, 1);
+  assert.equal(env.clock - callsFor(env, 'drag')[0].at, 30_000);
+  assert.equal(pressCalls(env, REFRAME_GENERATE).length, 0);
+  for (const action of ['capture', 'export', 'revert']) assert.equal(callsFor(env, action).length, 0);
+  assert.deepEqual((await pending()).poseBeforeDrag, NEUTRAL_POSE);
+  assert.equal((await pending()).poseAfterDrag, undefined);
+  assert.equal((await pending()).phase, 'editing');
+});
+
+test('a reset that leaves the cached pose unchanged stops without replaying reset or dragging', async t => {
+  const { workflow, env, pending } = await fixture(t, {
+    initialPose: [15, -8, 0, 0, 0, 1.15], hint: true, resetDoesNotChange: true,
+  });
+  await assert.rejects(workflow.process(ITEM), /대기 시간초과: 기본 구도 초기화/);
+  assert.equal(pressCalls(env, REFRAME_RESET).length, 1);
+  for (const action of ['drag', 'capture', 'export', 'revert']) assert.equal(callsFor(env, action).length, 0);
+  assert.equal((await pending()).phase, 'editing');
+});
 
 test('Edit returning attributeUnsupported after opening the exact editor is verified without replay and recorded before Tools', async t => {
   const { workflow, env, pending, runDir } = await fixture(t);
@@ -189,6 +272,102 @@ test('Edit attributeUnsupported without a transition stops after five seconds an
   assert.equal((await pending()).phase, 'editing');
   assert.equal((await pending()).baseline.assetId, ITEM.id);
   assert.equal((await pending()).editConfirmation, undefined);
+});
+
+test('Done returning attributeUnsupported after committing the exact photo is verified without replay before export', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async (action, args, call) => {
+    if (action !== 'press' || !sameSelector(args.selector, selectors.done)) return;
+    assert.equal(call.stage, 'applied');
+    assert.equal(call.pending.phase, 'saving');
+    env.edited = true;
+    env.draftApplied = false;
+    env.stage = 'viewer';
+    throw new Error(EDIT_PRESS_ERROR);
+  };
+  const result = await workflow.process(ITEM);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.doneConfirmation.pressError, EDIT_PRESS_ERROR);
+  assert.equal(result.doneConfirmation.assetId, ITEM.id);
+  assert.equal(result.doneConfirmation.appPid, 123);
+  assert.deepEqual(result.doneConfirmation.window, WINDOW);
+  assert.equal(pressCalls(env, selectors.done).length, 1);
+  const doneIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.done));
+  const exportIndex = env.calls.findIndex(call => call.action === 'export');
+  assert.ok(exportIndex > doneIndex);
+  const verification = env.calls.slice(doneIndex + 1, exportIndex);
+  assert.ok(verification.some(call => call.action === 'snapshot'));
+  assert.ok(verification.some(call => call.action === 'selection'));
+  assert.ok(verification.every(call => ['snapshot', 'selection', 'inspect'].includes(call.action)),
+    'Done must not be replayed or followed by another UI mutation after an ambiguous response');
+  assert.equal(callsFor(env, 'export').length, 1);
+  assert.deepEqual(callsFor(env, 'export')[0].pending.doneConfirmation, result.doneConfirmation,
+    'the confirmed ambiguous transition must be journaled before exporting');
+  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(await pending(), null);
+});
+
+test('Done attributeUnsupported without leaving the editor times out and preserves the saved draft journal', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async (action, args) => {
+    if (action === 'press' && sameSelector(args.selector, selectors.done)) throw new Error(EDIT_PRESS_ERROR);
+  };
+  await assert.rejects(workflow.process(ITEM), /AX_PRESS_FAILED: AXPress 실패: -25205; 화면 전환을 확인하지 못했습니다: 대기 시간초과/);
+  assert.equal(env.clock - pressCalls(env, selectors.done)[0].at, 5_000);
+  assert.equal(pressCalls(env, selectors.done).length, 1);
+  assert.equal(env.stage, 'applied');
+  assert.equal(env.draftApplied, true);
+  assert.equal(callsFor(env, 'export').length, 0);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'saving');
+  assert.equal((await pending()).baseline.assetId, ITEM.id);
+});
+
+for (const scenario of [
+  { name: 'foreground loss', change: env => { env.frontmost = false; }, error: /전면이 아니거나/ },
+  { name: 'a different photo ID', change: env => { env.selected.id = 'another-asset'; }, error: /선택한 사진이 바뀌었습니다/ },
+  { name: 'a different filename', change: env => { env.selected.filename = 'OTHER.JPG'; }, error: /선택한 사진이 바뀌었습니다/ },
+  { name: 'a different Photos process', change: env => { env.snapshotChanges = { appPid: 124 }; }, error: /사진 앱이나 창이 바뀌었습니다/ },
+  { name: 'a moved window', change: env => { env.snapshotChanges = { window: { title: '사진', rect: { ...WINDOW, x: WINDOW.x + 10 } } }; }, error: /사진 앱이나 창이 바뀌었습니다/ },
+]) {
+  test(`Done error verification rejects ${scenario.name} without export or another mutation`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    env.hook = async (action, args) => {
+      if (action !== 'press' || !sameSelector(args.selector, selectors.done)) return;
+      env.stage = 'viewer';
+      env.edited = true;
+      env.draftApplied = false;
+      scenario.change(env);
+      throw new Error(EDIT_PRESS_ERROR);
+    };
+    await assert.rejects(workflow.process(ITEM), error => {
+      assert.ok(error.message.startsWith(`${EDIT_PRESS_ERROR}; 화면 전환을 확인하지 못했습니다:`));
+      assert.match(error.message, scenario.error);
+      return true;
+    });
+    assert.equal(env.clock, pressCalls(env, selectors.done)[0].at);
+    assert.equal(pressCalls(env, selectors.done).length, 1);
+    assert.equal(callsFor(env, 'export').length, 0);
+    assert.equal(callsFor(env, 'revert').length, 0);
+    assert.equal((await pending()).phase, 'saving');
+    assert.equal((await pending()).baseline.assetId, ITEM.id);
+  });
+}
+
+test('Done does not suppress an unapproved error even if the viewer appeared', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  const failure = new Error('AX_PRESS_FAILED: AXPress 실패: -25202');
+  env.hook = async (action, args) => {
+    if (action !== 'press' || !sameSelector(args.selector, selectors.done)) return;
+    env.stage = 'viewer'; env.edited = true; env.draftApplied = false;
+    throw failure;
+  };
+  await assert.rejects(workflow.process(ITEM), error => error === failure);
+  const doneIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.done));
+  assert.equal(env.calls.length, doneIndex + 1);
+  assert.equal(callsFor(env, 'export').length, 0);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'saving');
 });
 
 for (const scenario of [
@@ -362,6 +541,109 @@ test('foreground loss after initial activation is fatal before baseline inspecti
   assert.equal(callsFor(env, 'inspect').length, 0);
   assert.equal(callsFor(env, 'press').length, 0);
   assert.equal(await pending(), null);
+});
+
+test('a stale AX element after Tools triggers a fresh tree read and never replays input', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  let failedRead;
+  env.hook = async (action, _args, call) => {
+    if (action === 'snapshot' && env.stage === 'tools' && !failedRead) {
+      failedRead = call;
+      throw new Error('AX_READ_FAILED: AXSubrole 조회 실패: -25202');
+    }
+  };
+  assert.equal((await workflow.process(ITEM)).status, 'complete');
+  const failedIndex = env.calls.indexOf(failedRead);
+  assert.ok(failedIndex >= 0);
+  assert.equal(env.calls[failedIndex + 1].action, 'snapshot');
+  assert.equal(env.calls[failedIndex + 1].at - failedRead.at, 250);
+  for (const selector of [selectors.edit, selectors.tools, REFRAME_ENTRY, REFRAME_GENERATE, selectors.save, selectors.done]) {
+    assert.equal(pressCalls(env, selector).length, 1, `no replay for ${JSON.stringify(selector)}`);
+  }
+  assert.equal(callsFor(env, 'show').length, 1);
+  assert.equal(callsFor(env, 'drag').length, 1);
+  assert.equal(callsFor(env, 'capture').length, 2);
+  assert.equal(callsFor(env, 'export').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(await pending(), null);
+});
+
+test('a persistently stale AX tree stops after three reads without another input and retains recovery', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  const failure = new Error('AX_READ_FAILED: AXSubrole 조회 실패: -25202');
+  env.hook = async action => {
+    if (action === 'snapshot' && env.stage === 'tools') throw failure;
+  };
+  await assert.rejects(workflow.process(ITEM), error => error === failure);
+  const toolsIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.tools));
+  const afterTools = env.calls.slice(toolsIndex + 1);
+  assert.deepEqual(afterTools.map(call => call.action), ['snapshot', 'snapshot', 'snapshot']);
+  assert.deepEqual(afterTools.map(call => call.at - afterTools[0].at), [0, 250, 500]);
+  assert.equal(pressCalls(env, selectors.tools).length, 1);
+  assert.equal(callsFor(env, 'drag').length, 0);
+  assert.equal(callsFor(env, 'export').length, 0);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).baseline.assetId, ITEM.id);
+});
+
+for (const message of [
+  'AX_READ_FAILED: AXSubrole 조회 실패: -25200',
+  'AX_READ_FAILED: AXSubrole 조회 실패: -25204',
+  'AX_PRESS_FAILED: AXPress 실패: -25202',
+  '보조 앱 응답 시간초과 (snapshot). 요청을 자동 재전송하지 않습니다.',
+  'AX_READ_FAILED: AXSubrole 조회 실패: -25202 unexpected suffix',
+]) {
+  test(`snapshot reading never retries another error: ${message}`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    const failure = new Error(message);
+    env.hook = async action => {
+      if (action === 'snapshot' && env.stage === 'tools') throw failure;
+    };
+    await assert.rejects(workflow.process(ITEM), error => error === failure);
+    const toolsIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.tools));
+    assert.deepEqual(env.calls.slice(toolsIndex + 1).map(call => call.action), ['snapshot']);
+    assert.equal(env.clock, env.calls[toolsIndex].at);
+    assert.equal(callsFor(env, 'drag').length, 0);
+    assert.equal((await pending()).phase, 'editing');
+  });
+}
+
+for (const scenario of [
+  { name: 'foreground loss', change: env => { env.frontmost = false; }, error: /전면이 아니거나/ },
+  { name: 'an unexpected alert', change: env => { env.extraNodes = [{ role: 'AXSheet' }]; }, error: /예상 밖 대화상자/ },
+  { name: 'an incomplete tree', change: env => { env.snapshotChanges = { truncated: true }; }, error: /완전한 사진 앱 UI 정보/ },
+]) {
+  test(`a fresh tree after a stale read still rejects ${scenario.name}`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    let toolsReads = 0;
+    env.hook = async action => {
+      if (action !== 'snapshot' || env.stage !== 'tools') return;
+      toolsReads += 1;
+      if (toolsReads === 1) throw new Error('AX_READ_FAILED: AXSubrole 조회 실패: -25202');
+      scenario.change(env);
+    };
+    await assert.rejects(workflow.process(ITEM), scenario.error);
+    assert.equal(toolsReads, 2);
+    const toolsIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.tools));
+    assert.deepEqual(env.calls.slice(toolsIndex + 1).map(call => call.action), ['snapshot', 'snapshot']);
+    assert.equal(env.clock - env.calls[toolsIndex].at, 250);
+    assert.equal(callsFor(env, 'drag').length, 0);
+    assert.equal((await pending()).phase, 'editing');
+  });
+}
+
+test('stop during a stale-tree retry prevents another read or input and keeps the journal', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async action => {
+    if (action === 'snapshot' && env.stage === 'tools') throw new Error('AX_READ_FAILED: AXSubrole 조회 실패: -25202');
+  };
+  env.pauseHook = async () => { if (env.stage === 'tools') env.stop = true; };
+  await assert.rejects(workflow.process(ITEM), /중지 요청/);
+  const toolsIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.tools));
+  assert.deepEqual(env.calls.slice(toolsIndex + 1).map(call => call.action), ['snapshot']);
+  assert.equal(callsFor(env, 'drag').length, 0);
+  assert.equal((await pending()).phase, 'editing');
 });
 
 test('foreground loss in the editor stops immediately and preserves its pending journal', async t => {
@@ -586,6 +868,35 @@ test('recovery cancels its Reframe modal and verifies unchanged content before e
   assert.equal(existsSync(record.outputs.jpeg), false);
   const completion = JSON.parse(await readFile(path.join(runDir, '.metadata', 'IMG_4321-recovery.json'), 'utf8'));
   assert.equal(completion.status, 'recovered-without-result');
+});
+
+test('recovery confirms an ambiguous Done after cancelling its modal without replay or export', async t => {
+  const { workflow, env, pending, runDir } = await fixture(t);
+  env.pauseHook = async () => { if (env.stage === 'generated') env.stop = true; };
+  await assert.rejects(workflow.process(ITEM), /중지 요청/);
+  const record = await pending();
+  env.stop = false;
+  env.pauseHook = null;
+  env.calls.length = 0;
+  env.hook = async (action, args, call) => {
+    if (action !== 'press' || !sameSelector(args.selector, selectors.done)) return;
+    assert.equal(call.stage, 'editing');
+    assert.equal(env.draftApplied, false);
+    assert.equal(pressCalls(env, selectors.cancel).length, 1);
+    env.stage = 'viewer';
+    throw new Error(EDIT_PRESS_ERROR);
+  };
+  const result = await workflow.recover(record);
+  assert.equal(result.status, 'recovered-without-result');
+  assert.equal(result.finalVerification.currentSHA256, BASELINE.currentSHA256);
+  assert.equal(result.finalVerification.hasAdjustments, false);
+  assert.equal(result.recoveryDoneConfirmation.pressError, EDIT_PRESS_ERROR);
+  assert.equal(result.recoveryDoneConfirmation.assetId, ITEM.id);
+  assert.equal(pressCalls(env, selectors.done).length, 1);
+  for (const action of ['export', 'verifyJPEG', 'revert']) assert.equal(callsFor(env, action).length, 0);
+  assert.equal(await pending(), null);
+  const completion = JSON.parse(await readFile(path.join(runDir, '.metadata', 'IMG_4321-recovery.json'), 'utf8'));
+  assert.deepEqual(completion.recoveryDoneConfirmation, result.recoveryDoneConfirmation);
 });
 
 test('JPEG verification rejects a mismatched destination before asking native code to decode', async t => {
