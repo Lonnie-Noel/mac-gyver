@@ -237,7 +237,7 @@ final class PhotosUI {
     private func attribute(_ element: AXUIElement, _ name: String) throws -> Any? {
         var result: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &result)
-        if status == .attributeUnsupported || status == .noValue { return nil }
+        if AXReadPolicy.canOmit(status, attribute: name) { return nil }
         guard status == .success else { throw UIError("AX_READ_FAILED", "\(name) 조회 실패: \(status.rawValue)") }
         return result
     }
