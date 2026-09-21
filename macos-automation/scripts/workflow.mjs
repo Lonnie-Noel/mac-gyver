@@ -41,7 +41,12 @@ export class PhotoWorkflow {
     return Array.isArray(items) && items.length === 1 && items[0].id === item.id && items[0].filename.normalize('NFC') === item.filename.normalize('NFC');
   }
   async show(item) {
-    this.checkStop(); await this.bridge.call('show', { id: item.id });
+    this.checkStop(); this.log(`사진 열기: ${item.filename}`);
+    await this.bridge.call('show', { id: item.id });
+    // Apple Events can return before Photos finishes becoming the front app.
+    // Only this initial transition may wait; later foreground loss is fatal.
+    await this.poll(async () => (await this.bridge.call('snapshot')).frontmost, '사진 앱 전면 전환');
+    this.log(`지정한 사진의 보기 화면 확인 중: ${item.filename}`);
     await this.poll(async () => {
       const ui = await this.ui();
       return ui.viewer && await this.selected(item) ? ui : false;
@@ -93,6 +98,7 @@ export class PhotoWorkflow {
   async process(item) {
     if (existsSync(this.pendingPath)) throw new Error('미완료 사진 기록이 있습니다. recover를 먼저 실행하세요.');
     await this.show(item);
+    this.log(`원본 사진과 기존 편집 여부 확인 중: ${item.filename}`);
     const baseline = await this.bridge.call('inspect', { assetId: item.id, expectedOriginalFilename: item.filename });
     if (baseline.assetId !== item.id || baseline.originalFilename.normalize('NFC') !== item.filename.normalize('NFC')) throw new Error('현재 Photos와 시스템 사진 보관함의 사진 ID가 일치하지 않습니다.');
     if (baseline.hasAdjustments === true) { this.log('기존 편집 사진 건너뜀'); return { item, status: 'skipped-existing-edits' }; }

@@ -63,18 +63,23 @@ async function main(){
     runDir=path.join(artifacts,`photos-${startedAt.replace(/[:.]/g,'-')}`);await mkdir(runDir,{mode:0o700});await privateDirectory(path.join(runDir,'.metadata'));
     manifest={version:2,runID,source:fromInput?'input-folder':'album',status:fromInput?'importing':'running',startedAt,album:plan?.album,photos:{},total:input?.files.length??plan.items.length};
     await atomicJSON(activePath,{pid:process.pid,runDir,action:'run'});await atomicJSON(path.join(runDir,'manifest.json'),manifest);
-    const recorder=createBridge({onRequest:r=>atomicJSON(path.join(runDir,'.metadata',`request-${r.id}.json`),r,{exclusive:true})});
+    const recorder=createBridge({onRequest:async r=>{
+      await atomicJSON(path.join(runDir,'.metadata',`request-${r.id}.json`),r,{exclusive:true});
+      manifest.lastRequest={id:r.id,action:r.action,at:new Date().toISOString()};
+      await atomicJSON(path.join(runDir,'manifest.json'),manifest);
+    }});
     if(fromInput){
       const albumName=`MacGyver InputImages ${startedAt}`;
       const journal={version:1,runID,albumName,directory:input.directory,files:input.files,ignored:input.ignored,imported:[]};
       await atomicJSON(path.join(runDir,'import.json'),journal);
-      console.log(`InputImages: ${input.files.length}장 가져오기\n결과 폴더: ${runDir}`);
+      console.log(`InputImages: ${input.files.length}장 가져오기\n결과 폴더: ${runDir}\n사진 앱에 복사한 뒤 원본 파일 검증까지 기다립니다.`);
       const imported=await importInputImages(recorder,input.files,{runID,albumName,stopped,onImported:async record=>{
         journal.imported.push(record);await atomicJSON(path.join(runDir,'import.json'),journal);
         manifest.album=record.album;await atomicJSON(path.join(runDir,'manifest.json'),manifest);
         console.log(`[가져오기 ${journal.imported.length}/${input.files.length}] ${record.source.filename}`);
       }});
       if(stopped())throw new Error('가져오기 후 중지했습니다.');
+      console.log('가져오기 완료. 사진 앱에서 작업 앨범과 사진 ID를 확인합니다…');
       const originalIDs=await waitForImportedAlbum(recorder,imported.album,imported.items,{stopped});
       plan={version:2,runID,createdAt:startedAt,...imported,directory:input.directory,originalIDs,startingItemID:imported.items[0].id};
       manifest.status='running';manifest.album=plan.album;await atomicJSON(path.join(runDir,'manifest.json'),manifest);
@@ -88,7 +93,7 @@ async function main(){
       const result=/\.(mov|mp4|m4v|avi)$/i.test(item.filename)?{item,status:'skipped-video'}:await workflow.process(item);manifest.photos[item.id]=result;visited++;manifest.updatedAt=new Date().toISOString();await atomicJSON(path.join(runDir,'manifest.json'),manifest);console.log(`[${visited}/${plan.items.length}] ${result.status}`);if(options.limit&&visited>=options.limit)break;
     }
     manifest.status=visited===plan.items.length?'complete':'paused-after-limit';manifest.finishedAt=new Date().toISOString();await atomicJSON(path.join(runDir,'manifest.json'),manifest);console.log(`작업 종료: ${manifest.status}\n${runDir}`);
-  }catch(error){if(manifest){manifest.status=stopped()?'stopped':'failed';manifest.error={at:new Date().toISOString(),message:error.message};await atomicJSON(path.join(runDir,'manifest.json'),manifest);}if(existsSync(pendingPath))console.error('미완료 사진 기록을 보존했습니다. 다음 실행 전에 npm run recover를 실행하세요.');throw error;}
+  }catch(error){if(manifest){manifest.status=stopped()?'stopped':'failed';manifest.error={at:new Date().toISOString(),message:error.message};await atomicJSON(path.join(runDir,'manifest.json'),manifest);console.error(`마지막 도우미 요청: ${manifest.lastRequest?.action??"없음"}\n오류 기록: ${path.join(runDir,'manifest.json')}`);}if(existsSync(pendingPath))console.error('미완료 사진 기록을 보존했습니다. 다음 실행 전에 npm run recover를 실행하세요.');throw error;}
   finally{process.off('SIGINT',onSignal);process.off('SIGTERM',onSignal);if(existsSync(activePath))await unlink(activePath);await release();}
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(error=>{console.error(error.message);process.exitCode=1;});

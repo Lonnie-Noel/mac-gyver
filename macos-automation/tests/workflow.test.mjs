@@ -145,6 +145,67 @@ test('one-photo workflow commits Save/Done, verifies JPEG before restoring, then
   assert.equal(completion.status, 'complete');
 });
 
+test('opening waits for delayed foreground activation before inspecting or editing the exact photo', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  let snapshots = 0;
+  const openedAt = env.clock;
+  env.hook = async action => {
+    if (action !== 'snapshot') return;
+    snapshots += 1;
+    env.frontmost = snapshots > 2;
+    if (!env.frontmost) {
+      assert.equal(callsFor(env, 'inspect').length, 0);
+      assert.equal(callsFor(env, 'press').length, 0);
+      assert.equal(await pending(), null);
+    }
+  };
+  assert.equal((await workflow.process(ITEM)).status, 'complete');
+  assert.ok(callsFor(env, 'inspect')[0].at - openedAt >= 2 * CONFIG.pollIntervalMs);
+  assert.equal(callsFor(env, 'show').length, 1, 'activation waits must not replay navigation');
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(await pending(), null);
+});
+
+test('opening times out without inspecting or editing when Photos never becomes frontmost', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  const startedAt = env.clock;
+  env.hook = async action => { if (action === 'snapshot') env.frontmost = false; };
+  await assert.rejects(workflow.process(ITEM), /대기 시간초과: 사진 앱 전면 전환/);
+  assert.equal(env.clock - startedAt, 30_000);
+  assert.equal(callsFor(env, 'show').length, 1);
+  for (const action of ['selection', 'inspect', 'press', 'drag', 'capture', 'export', 'revert']) {
+    assert.equal(callsFor(env, action).length, 0);
+  }
+  assert.equal(await pending(), null);
+});
+
+test('foreground loss after initial activation is fatal before baseline inspection', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  let snapshots = 0;
+  env.hook = async action => {
+    if (action === 'snapshot') env.frontmost = ++snapshots === 1;
+  };
+  await assert.rejects(workflow.process(ITEM), /사진 앱이 전면이 아니거나/);
+  assert.equal(snapshots, 2, 'foreground loss after opening must not be retried');
+  assert.equal(callsFor(env, 'inspect').length, 0);
+  assert.equal(callsFor(env, 'press').length, 0);
+  assert.equal(await pending(), null);
+});
+
+test('foreground loss in the editor stops immediately and preserves its pending journal', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async action => {
+    if (action === 'snapshot' && env.stage === 'editing') env.frontmost = false;
+  };
+  await assert.rejects(workflow.process(ITEM), /사진 앱이 전면이 아니거나/);
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(pressCalls(env, selectors.tools).length, 0);
+  assert.equal(callsFor(env, 'show').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).baseline.assetId, ITEM.id);
+});
+
 test('export waits until PhotoKit reports the committed edit after two stale unedited inspections', async t => {
   const { workflow, env, pending } = await fixture(t);
   const committedFlags = [];
