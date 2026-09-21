@@ -32,6 +32,6 @@ export async function openSettings({
   }
   await build();
   await show();
-  log('설정 창을 열었습니다. 네 권한을 하나씩 요청하세요. 재빌드 후 권한이 꼬였으면 이 앱 권한 초기화 후 종료를 누르고 설정 커맨드를 다시 실행하세요.');
+  log('설정 창을 열었습니다. 권한 상태를 확인하고 필요한 항목만 요청하세요. 창을 숨겨도 Dock 아이콘에서 다시 열 수 있습니다.');
   return 'ready';
 }

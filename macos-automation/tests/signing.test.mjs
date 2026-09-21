@@ -41,23 +41,27 @@ test('identity parsing ignores unsupported, invalid, expired, and duplicate entr
   assert.deepEqual(parseSigningIdentities(output), [{ fingerprint, label }, { fingerprint: otherFingerprint, label: otherLabel }]);
 });
 
-test('first build selects the only valid developer identity without persisting before verification', async t => {
+test('fresh Mac defaults to ad hoc without consulting keychain or creating a certificate pin', async t => {
   const { options, calls, preferencePath } = await fixture(t);
   const selected = await resolveSigningIdentity(options);
-  assert.equal(selected.identity, fingerprint);
-  assert.equal(selected.source, 'automatic');
-  assert.deepEqual(calls, [['/usr/bin/security', ['find-identity', '-v', '-p', 'codesigning']]]);
+  assert.equal(selected.identity, '-');
+  assert.equal(selected.source, 'default');
+  assert.equal(selected.mode, 'adhoc');
+  assert.deepEqual(calls, []);
+  await saveSigningPreference(selected, { bundleId, adhoc: true });
   await assert.rejects(fs.access(preferencePath), { code: 'ENOENT' });
 });
 
-test('first build with multiple identities requires an explicit choice', async t => {
-  const { options } = await fixture(t, { output: `${identityLine()}\n${identityLine(otherFingerprint, otherLabel)}` });
-  await assert.rejects(resolveSigningIdentity(options), /인증서가 여러 개/);
+test('fresh Mac does not automatically choose any installed developer certificate', async t => {
+  const { options, calls } = await fixture(t, { output: `${identityLine()}\n${identityLine(otherFingerprint, otherLabel)}` });
+  assert.equal((await resolveSigningIdentity(options)).mode, 'adhoc');
+  assert.equal(calls.length, 0);
 });
 
-test('missing valid identities never silently choose ad hoc', async t => {
+test('fresh Mac works with no certificate or keychain access', async t => {
   const { options } = await fixture(t, { output: ' 0 valid identities found' });
-  await assert.rejects(resolveSigningIdentity(options), /인증서가 없습니다/);
+  options.command = async () => { throw new Error('keychain must not be queried'); };
+  assert.equal((await resolveSigningIdentity(options)).identity, '-');
 });
 
 test('saved fingerprint wins over additional identities on subsequent builds', async t => {
@@ -119,7 +123,7 @@ test('signed app must have the selected leaf certificate, bundle ID, stable requ
 
 test('verifyAppSignature validates actual extracted leaf bytes after codesign integrity verification', async t => {
   const { options } = await fixture(t);
-  const selection = await resolveSigningIdentity(options);
+  const selection = await resolveSigningIdentity({ ...options, explicitIdentity: fingerprint });
   const calls = [];
   let extractionDirectory;
   const result = await verifyAppSignature('/mock/MacPhotosBridge.app', selection, {
@@ -151,7 +155,7 @@ test('signature verification failure does not proceed to metadata inspection', a
 
 test('certificate preference persists atomically with user-only directory and file permissions', async t => {
   const { options, preferencePath } = await fixture(t);
-  const selection = await resolveSigningIdentity(options);
+  const selection = await resolveSigningIdentity({ ...options, explicitIdentity: fingerprint });
   validateSignature(selection, details, certificate);
   await saveSigningPreference(selection, details);
   assert.deepEqual(await readSigningPreference(preferencePath, bundleId), saved);

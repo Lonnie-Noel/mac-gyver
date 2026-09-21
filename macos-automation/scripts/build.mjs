@@ -77,13 +77,13 @@ async function main() {
   const signing = await resolveSigningIdentity({ bundleId, command });
   const signingIdentity = signing.identity;
   if (signing.mode === 'adhoc') {
-    console.warn('MACOS_SIGNING_IDENTITY=- 요청으로 임시 서명을 사용합니다. 재빌드 후 권한 재승인이 필요할 수 있으며 저장된 개발자 인증서는 변경하지 않습니다.');
+    console.log(signing.source === 'default'
+      ? '개발자 인증서 없이 로컬 임시 서명으로 빌드합니다. Xcode 계정 로그인은 필요하지 않습니다. 재빌드 후 권한 재승인이 필요할 수 있습니다.'
+      : 'MACOS_SIGNING_IDENTITY=- 요청으로 임시 서명을 사용합니다. 재빌드 후 권한 재승인이 필요할 수 있으며 저장된 개발자 인증서는 변경하지 않습니다.');
   } else if (signing.changingIdentity) {
     console.warn('명시한 새 개발자 인증서로 변경합니다. 이번 빌드 후 macOS 권한 재승인이 필요할 수 있습니다.');
   } else {
-    console.log(signing.source === 'automatic'
-      ? '유효한 개발자 인증서 하나를 선택했습니다. 서명 검증 후 저장하고 다음 빌드에도 같은 인증서를 사용합니다.'
-      : '저장하거나 명시한 개발자 인증서로 서명합니다.');
+    console.log('저장하거나 명시한 개발자 인증서로 서명합니다.');
   }
   const hash = createHash('sha256');
   hash.update(JSON.stringify({ bundleId, signingIdentity, arch }));
@@ -110,6 +110,13 @@ async function main() {
   }
 
   await requireStoppedBridge();
+
+  try {
+    await command('/usr/bin/xcrun', ['--find', 'swiftc']);
+    await command('/usr/bin/xcrun', ['--sdk', 'macosx', '--show-sdk-path']);
+  } catch {
+    throw new Error('Swift 컴파일러와 macOS SDK를 찾을 수 없습니다. Xcode 전체 앱 대신 Command Line Tools만 설치해도 됩니다. 터미널에서 xcode-select --install을 실행해 설치를 마친 뒤 다시 실행하세요.');
+  }
 
   await fs.mkdir(buildRoot, { recursive: true, mode: 0o700 });
   await fs.mkdir(logRoot, { recursive: true, mode: 0o700 });

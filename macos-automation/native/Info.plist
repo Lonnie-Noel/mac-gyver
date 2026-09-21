@@ -17,9 +17,9 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.2.0</string>
+  <string>0.2.1</string>
   <key>CFBundleVersion</key>
-  <string>8</string>
+  <string>9</string>
   <key>LSMinimumSystemVersion</key>
   <string>15.2</string>
   <key>LSUIElement</key>
@@ -29,7 +29,7 @@
   <key>NSAppleEventsUsageDescription</key>
   <string>선택한 앨범의 사진을 열고 편집 및 내보내기를 수행하기 위해 사진 앱을 제어합니다.</string>
   <key>NSPhotoLibraryUsageDescription</key>
-  <string>InputImages의 사진을 작업 앨범에 복사하고 편집 결과를 JPEG로 저장한 뒤 원본으로 복귀하기 위해 사진 보관함 전체 접근이 필요합니다.</string>
+  <string>InputImages의 사진을 작업 앨범에 복사하고 편집 결과를 JPEG로 저장하기 위해 사진 보관함 전체 접근이 필요합니다.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

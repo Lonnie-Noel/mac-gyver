@@ -1,6 +1,6 @@
 {
   "name": "macgyver-macos-photos-automation",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Local macOS Photos Reframe automation with verified exports and recovery.",

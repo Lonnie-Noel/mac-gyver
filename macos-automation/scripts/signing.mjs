@@ -61,6 +61,11 @@ export async function resolveSigningIdentity({ bundleId, explicitIdentity = proc
     return { mode: 'adhoc', identity: '-', preferencePath, source: 'explicit', bundleId };
   }
   const saved = await readSigningPreference(preferencePath, bundleId);
+  // Fresh Macs use the original local ad-hoc signing flow. A developer account
+  // or keychain identity is needed only for an explicitly selected/saved cert.
+  if (!explicit && !saved) {
+    return { mode: 'adhoc', identity: '-', preferencePath, source: 'default', bundleId };
+  }
   const { stdout } = await command('/usr/bin/security', ['find-identity', '-v', '-p', 'codesigning']);
   const identities = parseSigningIdentities(stdout);
   let chosen;
@@ -76,14 +81,6 @@ export async function resolveSigningIdentity({ bundleId, explicitIdentity = proc
     chosen = identities.find(identity => identity.fingerprint === saved.fingerprint);
     if (!chosen) throw new Error('이전에 저장한 서명 인증서를 키체인에서 찾을 수 없거나 만료되었습니다. 기존 인증서와 개인 키를 복구하거나 MACOS_SIGNING_IDENTITY로 사용할 인증서를 명시하세요. 임시 서명으로 대체하지 않습니다.');
     source = 'saved';
-  } else {
-    if (identities.length !== 1) {
-      throw new Error(identities.length === 0
-        ? '유효한 Apple Development 또는 Developer ID Application 서명 인증서가 없습니다. Xcode > Settings > Accounts > Manage Certificates에서 개발 인증서를 만든 뒤 다시 빌드하세요. 임시 서명으로 자동 대체하지 않습니다.'
-        : '사용 가능한 개발자 서명 인증서가 여러 개입니다. security find-identity -v -p codesigning으로 확인하고 MACOS_SIGNING_IDENTITY에 사용할 인증서의 SHA-1 전체 값을 지정해 한 번 빌드하세요. 이후 같은 인증서를 기억합니다.');
-    }
-    [chosen] = identities;
-    source = 'automatic';
   }
   return { ...chosen, mode: 'certificate', identity: chosen.fingerprint, bundleId, preferencePath, source,
     previous: saved?.fingerprint === chosen.fingerprint ? saved : null,

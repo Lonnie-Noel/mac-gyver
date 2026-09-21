@@ -71,6 +71,27 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         statusItem = item
     }
 
+    private func installApplicationMenu() {
+        guard NSApp.mainMenu == nil else { return }
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Mac 사진 자동화")
+        let settings = NSMenuItem(title: "설정…", action: #selector(openSetup), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
+        appMenu.addItem(.separator())
+        let hide = NSMenuItem(title: "Mac 사진 자동화 가리기", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        hide.target = NSApp
+        appMenu.addItem(hide)
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(title: "Mac 사진 자동화 종료", action: #selector(quitHelper), keyEquivalent: "q")
+        quit.target = self
+        appMenu.addItem(quit)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+        NSApp.mainMenu = mainMenu
+    }
+
     @objc private func openSetup() { showSetup() }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -166,6 +187,10 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private func showSetup() {
+        // Keep the helper reachable from the Dock and Command-Tab after the
+        // settings window is hidden. Only unattended startup stays accessory.
+        NSApp.setActivationPolicy(.regular)
+        installApplicationMenu()
         if let window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refreshStatus(); return }
         let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 640),
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -199,7 +224,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         stack.addArrangedSubview(NSButton(title: "현재 앱 Finder에서 보기", target: self, action: #selector(revealHelper)))
         stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "같은 개발자 인증서로 재빌드할 때는 권한을 초기화하지 마세요. 승인 문제가 계속될 때만 아래 버튼을 사용하세요. 초기화하면 앱이 종료되고 네 권한을 다시 승인해야 합니다."))
         stack.addArrangedSubview(NSButton(title: "이 앱 권한 초기화 후 종료", target: self, action: #selector(resetPermissions)))
-        stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "창을 숨겨도 메뉴 막대의 ‘사진 자동화 → 설정 창 열기’에서 다시 열 수 있습니다. 앱을 다시 실행하거나 설정 커맨드를 실행해도 열립니다."))
+        stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "다른 창 뒤에 있으면 Dock 아이콘이나 Command-Tab으로 돌아오세요. 숨긴 설정 창은 Dock 아이콘, Command-, 또는 메뉴 막대의 ‘사진 자동화 → 설정 창 열기’로 다시 열 수 있습니다."))
         let footer = NSStackView(); footer.orientation = .horizontal; footer.spacing = 12
         for (title, action) in [("상태 새로고침", #selector(refreshStatus)), ("설정 창 숨기기", #selector(closeSetup)), ("보조 앱 종료", #selector(quitHelper))] {
             footer.addArrangedSubview(NSButton(title: title, target: self, action: action))
@@ -381,7 +406,7 @@ struct MacPhotosBridgeMain {
         let app = NSApplication.shared
         let delegate = BridgeAppDelegate()
         app.delegate = delegate
-        app.setActivationPolicy(.accessory)
+        app.setActivationPolicy(arguments.contains("--background") ? .accessory : .regular)
         withExtendedLifetime(delegate) { app.run() }
     }
 }
