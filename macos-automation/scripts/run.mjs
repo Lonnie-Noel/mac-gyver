@@ -84,13 +84,22 @@ async function main(){
       const mpath = path.join(runDir, 'manifest.json');
       if (!existsSync(mpath)) throw new Error('복구 작업의 manifest 기록이 없습니다. 미완료 기록을 보존합니다.');
       manifest = await readJSON(mpath);
+      manifest.lastRequest = null;
+      manifest.recovery = { startedAt: new Date().toISOString(), phase: pending.phase, status: 'running' };
+      await atomicJSON(mpath, manifest);
+      console.log(`미완료 사진 복구 시작: ${pending.item.filename}\n중단 단계: ${pending.phase}\n기록: ${mpath}`);
+      const recoveryBridge = createBridge({ onRequest: async request => {
+        await atomicJSON(path.join(runDir, '.metadata', `request-${request.id}.json`), request, { exclusive: true });
+        manifest.lastRequest = { id: request.id, action: request.action, at: new Date().toISOString(), context: 'recover' };
+        await atomicJSON(mpath, manifest);
+      } });
       const onComplete = async result => {
         if (result.item?.id !== pending.item.id || result.item?.filename !== pending.item.filename) throw new Error('복구 완료 기록의 사진 식별자가 다릅니다.');
-        const next = { ...manifest, photos: { ...manifest.photos, [result.item.id]: result }, status: 'recovered', updatedAt: new Date().toISOString() };
+        const next = { ...manifest, photos: { ...manifest.photos, [result.item.id]: result }, status: 'recovered', updatedAt: new Date().toISOString(), recovery: { ...manifest.recovery, status: 'complete', finishedAt: new Date().toISOString() } };
         await atomicJSON(mpath, next);
         manifest = next;
       };
-      const result = await new PhotoWorkflow({ bridge, config, runDir, pendingPath, stopped, onComplete }).recover(pending);
+      const result = await new PhotoWorkflow({ bridge: recoveryBridge, config, runDir, pendingPath, stopped, onComplete }).recover(pending);
       console.log(`사진 한 장 복구: ${result.status}\n${runDir}`);
       return;
     }
@@ -204,7 +213,23 @@ async function main(){
     else manifest.pausedAt = manifest.updatedAt;
     await atomicJSON(path.join(runDir, 'manifest.json'), manifest);
     console.log(`작업 종료: ${manifest.status}\n${runDir}\n작업 앨범과 저장한 편집 결과를 보존했습니다.${manifest.status === 'paused-after-limit' ? ' 다음 실행에서 남은 사진을 이어합니다.' : ''}`);
-  }catch(error){if(manifest){manifest.status=stopped()?'stopped':'failed';manifest.error={at:new Date().toISOString(),message:error.message};await atomicJSON(path.join(runDir,'manifest.json'),manifest);console.error(`마지막 도우미 요청: ${manifest.lastRequest?.action??"없음"}\n오류 기록: ${path.join(runDir,'manifest.json')}`);}if(existsSync(pendingPath))console.error('미완료 사진 기록을 보존했습니다. 다음 실행 전에 npm run recover를 실행하세요.');throw error;}
+  } catch (error) {
+    if (manifest) {
+      manifest.status = stopped() ? 'stopped' : 'failed';
+      manifest.error = { at: new Date().toISOString(), message: error.message, action: options.action };
+      if (options.action === 'recover') manifest.recovery = { ...manifest.recovery, status: 'failed', error: manifest.error };
+      await atomicJSON(path.join(runDir, 'manifest.json'), manifest);
+      console.error(`마지막 도우미 요청: ${manifest.lastRequest?.action ?? '없음'}\n오류 기록: ${path.join(runDir, 'manifest.json')}`);
+    }
+    if (existsSync(pendingPath)) {
+      if (options.action === 'recover') {
+        console.error('복구를 완료하지 못했습니다. 미완료 기록은 보존했습니다. 아래 오류 원인을 먼저 해결해야 합니다.');
+      } else {
+        console.error('미완료 사진 기록을 보존했습니다. Mac 사진 자동화 복구.command 또는 npm run recover를 실행하세요.');
+      }
+    }
+    throw error;
+  }
   finally{process.off('SIGINT',onSignal);process.off('SIGTERM',onSignal);if(existsSync(activePath)&&(await readJSON(activePath)).pid===process.pid)await unlink(activePath);await release();}
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(error=>{console.error(error.message);process.exitCode=1;});

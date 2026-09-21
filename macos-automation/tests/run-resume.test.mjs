@@ -101,6 +101,11 @@ export class PhotoWorkflow {
  }
  async recover(pending){
   await record({action:'recover',item:pending.item});
+  const failure=path.join(root,'fail-recover');
+  if(existsSync(failure)){
+    await this.bridge.call('snapshot');
+    throw new Error(await readFile(failure,'utf8'));
+  }
   const result={item:pending.item,status:'recovered-without-result',phase:'restored'};
   await this.onComplete(result);
   const saved=await readJSON(path.join(this.runDir,'manifest.json'));
@@ -306,4 +311,36 @@ test('modified copy membership stops resume before editing; source additions do 
   await assert.rejects(() => f.invoke('resume'), e => /작업 앨범을 확인하지 못했습니다/.test(e.stderr));
   assert.equal((await f.calls()).filter(c => c.action === 'process').length, 2);
   assert.equal((await f.calls()).filter(c => c.action === 'cloneAlbum').length, 1);
+});
+
+
+test('failed recovery reports its real error without telling the user to run recovery again; logs current recovery request', async t => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.directory,'fail-filename'),'b.jpg');
+  await assert.rejects(() => f.invoke('run'));
+  const before = await f.state();
+  const pending = await readFile(path.join(f.directory,'artifacts/pending-edit.json'),'utf8');
+  const errorMessage = '복구 중 미저장 편집 화면을 발견했습니다. 사진 보기 화면으로 돌아오세요.';
+  await writeFile(path.join(f.directory,'fail-recover'),errorMessage);
+  await assert.rejects(() => f.invoke('recover'), error => {
+    assert.match(error.stdout,/미완료 사진 복구 시작: b.jpg/);
+    assert.match(error.stderr,/복구를 완료하지 못했습니다/);
+    assert.ok(error.stderr.includes(errorMessage));
+    assert.doesNotMatch(error.stderr,/npm run recover/);
+    assert.match(error.stderr,/마지막 도우미 요청: snapshot/);
+    return true;
+  });
+  const failed = await f.state();
+  assert.equal(failed.manifest.error.message,errorMessage);
+  assert.equal(failed.manifest.error.action,'recover');
+  assert.equal(failed.manifest.recovery.status,'failed');
+  assert.equal(failed.manifest.lastRequest.context,'recover');
+  assert.notEqual(failed.manifest.lastRequest.id,before.manifest.lastRequest?.id);
+  const request=await read(path.join(failed.pointer.runDir,'.metadata',`request-${failed.manifest.lastRequest.id}.json`));
+  assert.equal(request.action,'snapshot');
+  assert.equal(await readFile(path.join(f.directory,'artifacts/pending-edit.json'),'utf8'),pending);
+  assert.deepEqual(failed.manifest.photos,before.manifest.photos);
+  await rm(path.join(f.directory,'fail-recover'));
+  await f.invoke('recover');
+  assert.equal((await f.state()).manifest.recovery.status,'complete');
 });
