@@ -3,7 +3,7 @@ import ApplicationServices
 @main
 struct AXReadPolicyTests {
     static func main() {
-        let optionalLabels = [kAXSubroleAttribute, kAXDescriptionAttribute].map { $0 as String }
+        let optionalLabels = [kAXSubroleAttribute, kAXDescriptionAttribute, kAXValueAttribute].map { $0 as String }
         precondition(AXError.failure.rawValue == -25200)
         for name in optionalLabels {
             precondition(AXReadPolicy.canOmit(.failure, attribute: name))
@@ -17,7 +17,7 @@ struct AXReadPolicyTests {
         for name in [kAXRoleAttribute, kAXEnabledAttribute, kAXChildrenAttribute,
                      kAXMainWindowAttribute, kAXMainAttribute, kAXPositionAttribute, kAXSizeAttribute,
                      kAXMenuBarAttribute, kAXParentAttribute, kAXIdentifierAttribute,
-                     kAXTitleAttribute, kAXValueAttribute, kAXSelectedAttribute] {
+                     kAXTitleAttribute, kAXSelectedAttribute] {
             precondition(!AXReadPolicy.canOmit(.failure, attribute: name as String))
         }
         precondition(!AXReadPolicy.canOmit(.failure, attribute: "AXUnknownAttribute"))

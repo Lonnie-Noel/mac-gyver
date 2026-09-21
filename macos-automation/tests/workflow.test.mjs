@@ -29,7 +29,7 @@ async function fixture(t, options = {}) {
   const env = { stage: 'viewer', frontmost: true, selected: { ...ITEM }, edited: !!options.edited,
     clock: Date.UTC(2026, 0, 1), stop: false, calls: [], hook: null, pauseHook: null,
     exportError: null, verifyError: null, exportChanges: null, inspectChanges: null,
-    corruptExport: false, draftApplied: false };
+    corruptExport: false, draftApplied: false, snapshotChanges: null, extraNodes: [] };
   const pending = async () => existsSync(pendingPath) ? JSON.parse(await readFile(pendingPath, 'utf8')) : null;
   const state = () => {
     const nodes = [];
@@ -44,7 +44,8 @@ async function fixture(t, options = {}) {
         rect: { x: 200, y: 150, width: 1000, height: 700 } });
       if (env.stage === 'ready') nodes.push({ role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' });
     }
-    return { frontmost: env.frontmost, appPid: 123, window: { title: '사진', rect: { ...WINDOW } }, nodes, truncated: false };
+    return { frontmost: env.frontmost, appPid: 123, window: { title: '사진', rect: { ...WINDOW } },
+      nodes: [...nodes, ...env.extraNodes], truncated: false, ...env.snapshotChanges };
   };
   const current = () => ({ ...BASELINE, hasAdjustments: env.edited,
     currentSHA256: env.edited ? 'c'.repeat(64) : BASELINE.currentSHA256 });
@@ -143,6 +144,177 @@ test('one-photo workflow commits Save/Done, verifies JPEG before restoring, then
   assert.deepEqual(await readFile(path.join(runDir, 'IMG_4321-preview-capture.png')), PNG);
   const completion = JSON.parse(await readFile(path.join(runDir, '.metadata', 'IMG_4321-result.json'), 'utf8'));
   assert.equal(completion.status, 'complete');
+});
+
+const EDIT_PRESS_ERROR = 'AX_PRESS_FAILED: AXPress 실패: -25205';
+
+test('Edit returning attributeUnsupported after opening the exact editor is verified without replay and recorded before Tools', async t => {
+  const { workflow, env, pending, runDir } = await fixture(t);
+  env.hook = async (action, args, call) => {
+    if (action !== 'press') return;
+    if (sameSelector(args.selector, selectors.edit)) {
+      assert.equal(call.pending.phase, 'editing');
+      env.stage = 'editing';
+      throw new Error(EDIT_PRESS_ERROR);
+    }
+    if (sameSelector(args.selector, selectors.tools)) {
+      assert.equal(call.pending.editConfirmation.pressError, EDIT_PRESS_ERROR);
+      assert.equal(call.pending.editConfirmation.assetId, ITEM.id);
+      assert.equal(call.pending.editConfirmation.appPid, 123);
+      assert.deepEqual(call.pending.editConfirmation.window, WINDOW);
+      assert.ok(Number.isFinite(Date.parse(call.pending.editConfirmation.confirmedAt)));
+    }
+  };
+  const result = await workflow.process(ITEM);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.editConfirmation.pressError, EDIT_PRESS_ERROR);
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(pressCalls(env, selectors.tools).length, 1);
+  assert.equal(await pending(), null);
+  const completion = JSON.parse(await readFile(path.join(runDir, '.metadata', 'IMG_4321-result.json'), 'utf8'));
+  assert.deepEqual(completion.editConfirmation, result.editConfirmation);
+});
+
+test('Edit attributeUnsupported without a transition stops after five seconds and keeps the pending journal', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async (action, args) => {
+    if (action === 'press' && sameSelector(args.selector, selectors.edit)) throw new Error(EDIT_PRESS_ERROR);
+  };
+  await assert.rejects(workflow.process(ITEM), /AX_PRESS_FAILED: AXPress 실패: -25205; 화면 전환을 확인하지 못했습니다: 대기 시간초과/);
+  assert.equal(env.clock - pressCalls(env, selectors.edit)[0].at, 5_000);
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(pressCalls(env, selectors.tools).length, 0);
+  assert.equal(callsFor(env, 'drag').length, 0);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).baseline.assetId, ITEM.id);
+  assert.equal((await pending()).editConfirmation, undefined);
+});
+
+for (const scenario of [
+  { name: 'foreground loss', change: env => { env.frontmost = false; }, error: /전면이 아니거나/ },
+  { name: 'a different photo ID', change: env => { env.selected.id = 'another-asset'; }, error: /선택한 사진이 바뀌었습니다/ },
+  { name: 'a different filename for the same ID', change: env => { env.selected.filename = 'OTHER.JPG'; }, error: /선택한 사진이 바뀌었습니다/ },
+  { name: 'empty selection', change: env => { env.selected = null; }, error: /선택한 사진이 바뀌었습니다/ },
+  { name: 'a moved window', change: env => { env.snapshotChanges = { window: { title: '사진', rect: { ...WINDOW, x: WINDOW.x + 10 } } }; }, error: /사진 앱이나 창이 바뀌었습니다/ },
+  { name: 'a different Photos process', change: env => { env.snapshotChanges = { appPid: 124 }; }, error: /사진 앱이나 창이 바뀌었습니다/ },
+  { name: 'an unexpected alert', change: env => { env.extraNodes = [{ role: 'AXSheet', enabled: true }]; }, error: /예상 밖 대화상자/ },
+  { name: 'a truncated snapshot', change: env => { env.snapshotChanges = { truncated: true }; }, error: /완전한 사진 앱 UI 정보/ },
+]) {
+  test(`Edit error verification rejects ${scenario.name} immediately without another mutation`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    env.hook = async (action, args) => {
+      if (action !== 'press' || !sameSelector(args.selector, selectors.edit)) return;
+      env.stage = 'editing';
+      scenario.change(env);
+      throw new Error(EDIT_PRESS_ERROR);
+    };
+    await assert.rejects(workflow.process(ITEM), error => {
+      assert.ok(error.message.startsWith(`${EDIT_PRESS_ERROR}; 화면 전환을 확인하지 못했습니다:`));
+      assert.match(error.message, scenario.error);
+      return true;
+    });
+    assert.equal(env.clock, pressCalls(env, selectors.edit)[0].at, 'unsafe state must fail before any polling delay');
+    assert.equal(callsFor(env, 'press').length, 1);
+    assert.equal(callsFor(env, 'drag').length, 0);
+    assert.equal(callsFor(env, 'revert').length, 0);
+    assert.equal((await pending()).baseline.assetId, ITEM.id);
+    assert.equal((await pending()).editConfirmation, undefined);
+  });
+}
+
+for (const message of [
+  'AX_PRESS_FAILED: AXPress 실패: -25202',
+  'AX_PRESS_FAILED: AXPress 실패: -25204',
+  'PRESS_UNSUPPORTED: 선택한 요소가 AXPress 동작을 제공하지 않습니다.',
+  '보조 앱 응답 시간초과 (press). 요청을 자동 재전송하지 않습니다.',
+  `${EDIT_PRESS_ERROR} unexpected suffix`,
+]) {
+  test(`Edit does not suppress an unapproved error even when the editor appeared: ${message}`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    const failure = new Error(message);
+    env.hook = async (action, args) => {
+      if (action !== 'press' || !sameSelector(args.selector, selectors.edit)) return;
+      env.stage = 'editing';
+      throw failure;
+    };
+    await assert.rejects(workflow.process(ITEM), error => error === failure);
+    const dispatched = env.calls.findIndex(call => call.action === 'press');
+    assert.equal(env.calls.length, dispatched + 1, 'unapproved errors must not enter postcondition verification');
+    assert.equal(callsFor(env, 'press').length, 1);
+    assert.equal((await pending()).phase, 'editing');
+    assert.equal((await pending()).editConfirmation, undefined);
+  });
+}
+
+test('a delayed editor transition after the allowed error only polls and never sends Edit again', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  let editAt;
+  let delayedTransitionPending = false;
+  env.hook = async (action, args) => {
+    if (action === 'press' && sameSelector(args.selector, selectors.edit)) {
+      editAt = env.clock;
+      delayedTransitionPending = true;
+      throw new Error(EDIT_PRESS_ERROR);
+    }
+    if (action === 'snapshot' && delayedTransitionPending && env.clock - editAt >= 2_000) {
+      env.stage = 'editing';
+      delayedTransitionPending = false;
+    }
+    if (action === 'press' && sameSelector(args.selector, selectors.tools)) {
+      assert.equal(env.clock - editAt, 2_000);
+      assert.equal(pressCalls(env, selectors.edit).length, 1);
+    }
+  };
+  assert.equal((await workflow.process(ITEM)).status, 'complete');
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  const editIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.edit));
+  const toolsIndex = env.calls.findIndex(call => call.action === 'press' && sameSelector(call.args.selector, selectors.tools));
+  assert.ok(env.calls.slice(editIndex + 1, toolsIndex).every(call => ['snapshot', 'selection'].includes(call.action)));
+  assert.equal(await pending(), null);
+});
+
+test('stopping while verifying an ambiguous Edit retains the journal and does not proceed to Tools', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async (action, args) => {
+    if (action === 'press' && sameSelector(args.selector, selectors.edit)) throw new Error(EDIT_PRESS_ERROR);
+  };
+  env.pauseHook = async () => { env.stop = true; };
+  await assert.rejects(workflow.process(ITEM), /화면 전환을 확인하지 못했습니다: 중지 요청/);
+  assert.equal(env.clock - pressCalls(env, selectors.edit)[0].at, CONFIG.pollIntervalMs);
+  assert.equal(callsFor(env, 'press').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).editConfirmation, undefined);
+});
+
+test('the same attributeUnsupported error on Tools remains fatal even if the Tools screen appeared', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  const failure = new Error(EDIT_PRESS_ERROR);
+  env.hook = async (action, args) => {
+    if (action !== 'press' || !sameSelector(args.selector, selectors.tools)) return;
+    env.stage = 'tools';
+    throw failure;
+  };
+  await assert.rejects(workflow.process(ITEM), error => error === failure);
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(pressCalls(env, selectors.tools).length, 1);
+  assert.equal(pressCalls(env, selectors.reframe).length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).editConfirmation, undefined);
+});
+
+test('normal Edit response still requires the editor postcondition and keeps its thirty-second timeout', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.hook = async action => {
+    if (action === 'snapshot' && pressCalls(env, selectors.edit).length) env.stage = 'viewer';
+  };
+  await assert.rejects(workflow.process(ITEM), /^Error: 대기 시간초과: 같은 사진의 편집 화면$/);
+  assert.equal(env.clock - pressCalls(env, selectors.edit)[0].at, 30_000);
+  assert.equal(pressCalls(env, selectors.edit).length, 1);
+  assert.equal(pressCalls(env, selectors.tools).length, 0);
+  assert.equal((await pending()).phase, 'editing');
+  assert.equal((await pending()).editConfirmation, undefined);
 });
 
 test('opening waits for delayed foreground activation before inspecting or editing the exact photo', async t => {

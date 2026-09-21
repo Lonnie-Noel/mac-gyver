@@ -11,7 +11,7 @@ import { selectors, uniqueNode, readUI } from '../scripts/core.mjs';
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
 
-test('native AX reads tolerate optional subrole/description failure and preserve critical failures', { skip: process.platform !== 'darwin' }, async t => {
+test('native AX reads tolerate optional subrole/description/value failure and preserve critical failures', { skip: process.platform !== 'darwin' }, async t => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'macgyver-ax-policy-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const executable = path.join(temp, 'ax-policy-tests');
@@ -32,6 +32,17 @@ test('an omitted description cannot match the Tools action or prove Reframe read
     ],
   };
   assert.throws(() => uniqueNode(snapshot, selectors.tools), /\(0\)/);
+  assert.equal(readUI(snapshot).reframeReady, false);
+  assert.equal(readUI(snapshot).generated, false);
+});
+
+test('an omitted scalar value cannot satisfy a value selector or prove Reframe readiness', () => {
+  const snapshot = {
+    window: { rect: { x: 0, y: 0, width: 800, height: 600 } },
+    nodes: [{ role: 'AXStaticText', enabled: true },
+      { identifier: 'IPXEditModalCancelChanges', enabled: true }],
+  };
+  assert.throws(() => uniqueNode(snapshot, { role: 'AXStaticText', value: '드래그하여 시점을 조절하십시오.' }), /\(0\)/);
   assert.equal(readUI(snapshot).reframeReady, false);
   assert.equal(readUI(snapshot).generated, false);
 });

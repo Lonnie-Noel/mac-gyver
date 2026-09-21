@@ -31,13 +31,24 @@ final class PhotosUI {
         let windowTitle: String
         var entries: [Entry]
         var truncated: Bool
+        var truncation: [String: Any]?
+
+        mutating func markTruncated(_ reason: String, path: String, depth: Int, firstPath: String? = nil) {
+            truncated = true
+            guard truncation == nil else { return }
+            var detail: [String: Any] = ["reason": reason, "path": path, "depth": depth]
+            if let firstPath { detail["firstPath"] = firstPath }
+            truncation = detail
+        }
     }
 
     func snapshot() throws -> [String: Any] {
         let tree = try readTree()
-        return ["frontmost": isFrontmost(tree.application), "appPid": Int(tree.application.processIdentifier),
+        var result: [String: Any] = ["frontmost": isFrontmost(tree.application), "appPid": Int(tree.application.processIdentifier),
             "window": ["title": tree.windowTitle, "rect": dictionary(tree.windowRect)],
             "nodes": tree.entries.map(\.fields), "truncated": tree.truncated]
+        if let truncation = tree.truncation { result["truncation"] = truncation }
+        return result
     }
 
     func press(_ args: [String: Any]) throws -> [String: Any] {
@@ -194,7 +205,7 @@ final class PhotosUI {
         let windowTitle = try attribute(mainWindow, kAXTitleAttribute as String) as? String ?? ""
         var tree = Tree(application: application, windowElement: mainWindow, windowRect: windowRect,
             windowTitle: windowTitle, entries: [], truncated: false)
-        var seen: Set<CFHashCode> = []
+        var seen = AXTraversalIdentity()
         try append(mainWindow, path: "window", parent: nil, depth: 0, tree: &tree, seen: &seen)
         if let menuBar = try elementAttribute(appElement, kAXMenuBarAttribute as String) {
             try append(menuBar, path: "menuBar", parent: nil, depth: 0, tree: &tree, seen: &seen)
@@ -203,9 +214,19 @@ final class PhotosUI {
     }
 
     private func append(_ element: AXUIElement, path: String, parent: String?, depth: Int,
-                        tree: inout Tree, seen: inout Set<CFHashCode>) throws {
-        guard tree.entries.count < maximumNodes, depth <= maximumDepth else { tree.truncated = true; return }
-        guard seen.insert(CFHash(element)).inserted else { tree.truncated = true; return }
+                        tree: inout Tree, seen: inout AXTraversalIdentity) throws {
+        guard tree.entries.count < maximumNodes else {
+            tree.markTruncated("nodeLimit", path: path, depth: depth)
+            return
+        }
+        guard depth <= maximumDepth else {
+            tree.markTruncated("depthLimit", path: path, depth: depth)
+            return
+        }
+        if let firstPath = seen.visit(element, path: path) {
+            tree.markTruncated("repeatedElement", path: path, depth: depth, firstPath: firstPath)
+            return
+        }
         var fields: [String: Any] = ["path": path, "role": try attribute(element, kAXRoleAttribute as String) as? String ?? "AXUnknown",
             "enabled": try attribute(element, kAXEnabledAttribute as String) as? Bool ?? false]
         if let parent { fields["parent"] = parent }
@@ -218,7 +239,10 @@ final class PhotosUI {
         tree.entries.append(Entry(element: element, fields: fields))
         let children = try attribute(element, kAXChildrenAttribute as String) as? [AXUIElement] ?? []
         for (index, child) in children.enumerated() {
-            if tree.entries.count >= maximumNodes { tree.truncated = true; break }
+            if tree.entries.count >= maximumNodes {
+                tree.markTruncated("nodeLimit", path: "\(path)/\(index)", depth: depth + 1)
+                break
+            }
             try append(child, path: "\(path)/\(index)", parent: path, depth: depth + 1, tree: &tree, seen: &seen)
         }
     }

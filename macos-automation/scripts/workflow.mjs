@@ -57,6 +57,34 @@ export class PhotoWorkflow {
     if (expectedWindow && !sameRect(state.snapshot.window.rect, expectedWindow)) throw new Error('사진 창 위치나 크기가 바뀌었습니다.');
     this.checkStop(); return this.bridge.call('press', { selector: { ...selector, enabled: true }, expectedWindow: expectedWindow ?? state.snapshot.window.rect });
   }
+  async enterEditor(item) {
+    const before = await this.ui();
+    if (!before.viewer || !await this.selected(item)) throw new Error('편집 전에 선택한 사진이 바뀌었습니다.');
+    let pressError;
+    try { await this.press(selectors.edit, before.snapshot.window.rect); }
+    catch (error) {
+      // Photos can open its editor yet report attributeUnsupported from AXPress.
+      // This observed Edit-only case is ambiguous: inspect, never press again.
+      if (error.message !== 'AX_PRESS_FAILED: AXPress 실패: -25205') throw error;
+      pressError = error;
+    }
+    try {
+      await this.poll(async () => {
+        const after = await this.ui();
+        if (after.snapshot.appPid !== before.snapshot.appPid || !sameRect(after.snapshot.window.rect, before.snapshot.window.rect)) throw new Error('편집 화면 확인 중 사진 앱이나 창이 바뀌었습니다.');
+        if (!await this.selected(item)) throw new Error('편집 화면 확인 중 선택한 사진이 바뀌었습니다.');
+        return after.editing && !after.viewer && !after.modal;
+      }, '같은 사진의 편집 화면', pressError ? 5_000 : 30_000);
+    } catch (error) {
+      if (pressError) throw new Error(`${pressError.message}; 화면 전환을 확인하지 못했습니다: ${error.message}`, { cause: error });
+      throw error;
+    }
+    if (pressError) {
+      this.log('편집 버튼이 오류를 반환했지만 같은 사진의 편집 화면 전환을 확인했습니다. 버튼을 다시 누르지 않습니다.');
+      return { pressError: pressError.message, assetId: item.id, appPid: before.snapshot.appPid,
+        window: before.snapshot.window.rect, confirmedAt: new Date(this.now()).toISOString() };
+    }
+  }
   async update(record, changes) {
     Object.assign(record, changes, { updatedAt: new Date(this.now()).toISOString() });
     await atomicJSON(this.pendingPath, record); return record;
@@ -110,7 +138,8 @@ export class PhotoWorkflow {
     const record = { version: 1, item, baseline, outputBase, outputs, runDir: this.runDir, phase: 'editing', startedAt: new Date(this.now()).toISOString() };
     await atomicJSON(this.pendingPath, record, { exclusive: true });
     this.log(`편집 시작: ${baseline.originalFilename}`);
-    await this.press(selectors.edit); await this.poll(async () => (await this.ui()).editing, '편집 화면');
+    const editConfirmation = await this.enterEditor(item);
+    if (editConfirmation) await this.update(record, { editConfirmation });
     await this.press(selectors.tools); await this.poll(async () => (await this.ui()).tools, '도구 화면');
     await this.press(selectors.reframe);
     const prepared = await this.poll(async () => { const s=await this.ui(); return s.reframeReady ? s : false; }, '프레임 재설정 준비', this.config.generationTimeoutSeconds * 1000);
