@@ -121,5 +121,7 @@ export function validateConfig(config) {
   }
   if (config.generationTimeoutSeconds < config.minimumGenerationSeconds) throw new Error('생성 시간제한은 최소 대기보다 길어야 합니다.');
   if (config.albumId !== null && (typeof config.albumId !== 'string' || !config.albumId.trim())) throw new Error('albumId는 비어 있지 않은 ID 또는 null이어야 합니다.');
+  if (config.albumName != null && (typeof config.albumName !== 'string' || !config.albumName.trim())) throw new Error('albumName은 비어 있지 않은 이름 또는 null이어야 합니다.');
+  if (config.albumName != null && config.albumName !== 'Reframe') throw new Error('원본 앨범 이름은 Reframe을 사용하세요.');
   return config;
 }

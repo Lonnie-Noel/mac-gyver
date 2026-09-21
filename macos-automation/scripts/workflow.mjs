@@ -167,11 +167,26 @@ export class PhotoWorkflow {
     this.log('원본 복원 및 편집 전 이미지 해시 일치 확인');
     return result;
   }
+  async inspectBeforeEditing(item) {
+    // Retry only a complete, read-only pre-edit inspection whose coherent-read
+    // guard failed. Each attempt rechecks UI identity; no UI input is replayed.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      this.checkStop();
+      const ui = await this.ui();
+      if (!ui.viewer || !await this.selected(item)) throw new Error('사진 검사 전에 선택한 사진 또는 화면이 바뀌었습니다.');
+      try { return await this.bridge.call('inspect', { assetId: item.id, expectedOriginalFilename: item.filename }); }
+      catch (error) {
+        if (error.message !== '검사 중 사진이 변경되었습니다.' || attempt === 2) throw error;
+        this.log('사진 상태가 검사 중 갱신되어 같은 사진을 다시 확인합니다. 아직 편집하지 않았습니다.');
+        await this.pause(this.config.pollIntervalMs);
+      }
+    }
+  }
   async process(item) {
     if (existsSync(this.pendingPath)) throw new Error('미완료 사진 기록이 있습니다. recover를 먼저 실행하세요.');
     await this.show(item);
     this.log(`원본 사진과 기존 편집 여부 확인 중: ${item.filename}`);
-    const baseline = await this.bridge.call('inspect', { assetId: item.id, expectedOriginalFilename: item.filename });
+    const baseline = await this.inspectBeforeEditing(item);
     if (baseline.assetId !== item.id || baseline.originalFilename.normalize('NFC') !== item.filename.normalize('NFC')) throw new Error('현재 Photos와 시스템 사진 보관함의 사진 ID가 일치하지 않습니다.');
     if (baseline.hasAdjustments === true) { this.log('기존 편집 사진 건너뜀'); return { item, status: 'skipped-existing-edits' }; }
     if (baseline.hasAdjustments !== false) throw new Error('기존 편집 여부를 판단하지 못했습니다.');

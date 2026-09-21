@@ -115,7 +115,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 "screenCapture": CGPreflightScreenCaptureAccess(), "photos": photoStatus,
                 "photosAutomation": automation == noErr, "photosAutomationStatus": automation,
                 "busy": busy || permissionBusy, "currentRequest": currentID ?? "", "protocolVersion": 2,
-                "capabilities": ["input-images-v1", "input-images-file-resource-v1", "input-images-batch-v1"],
+                "capabilities": ["input-images-v1", "input-images-file-resource-v1", "input-images-batch-v1", "clone-reframe-album-v1"],
                 "helperVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                 "executable": Bundle.main.executableURL?.path ?? ""]
     }
@@ -181,6 +181,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "selection", "albums", "albumItems", "show", "activate": return try PhotosScripting.handle(action, args: args)
         case "inspect", "export", "retain", "revert", "verifyJPEG": return try await media.handle(action, args: args)
         case "importImage": return try await importer.importImage(args)
+        case "cloneAlbum": return try await importer.cloneAlbum(args)
         case "importImages": return try await importer.importImages(args)
         default: throw HostError("지원하지 않는 명령입니다: \(action)")
         }

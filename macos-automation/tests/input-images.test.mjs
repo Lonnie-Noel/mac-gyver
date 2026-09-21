@@ -264,15 +264,17 @@ test('imported album verification rejects extra, missing, duplicated, foreign as
   ]) assert.throws(() => verifyImportedAlbum(contents, ALBUM, items), Error);
 });
 
-test('default CLI plan hashes InputImages without config, a helper, or any access outside its temporary project', async t => {
+test('default CLI plan hashes InputImages without a helper or any access outside its temporary project', async t => {
   const directory = await inputDirectory(t, {});
   const scripts = path.join(directory, 'scripts');
   const inputs = path.join(directory, 'InputImages');
   await mkdir(scripts);
   await mkdir(inputs);
-  for (const filename of ['run.mjs', 'bridge.mjs', 'core.mjs', 'workflow.mjs', 'runtime.mjs', 'setup.mjs', 'input-images.mjs', 'batch-state.mjs']) {
+  for (const filename of ['run.mjs', 'bridge.mjs', 'core.mjs', 'workflow.mjs', 'runtime.mjs', 'setup.mjs', 'input-images.mjs', 'batch-state.mjs', 'named-album.mjs']) {
     await copyFile(new URL(`../scripts/${filename}`, import.meta.url), path.join(scripts, filename));
   }
+  const defaults = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
+  await writeFile(path.join(directory, 'config.example.json'), JSON.stringify({ ...defaults, albumName: null }));
   // Deliberately not a decodable JPEG: offline planning only inventories bytes.
   const bytes = Buffer.from('arbitrary synthetic fake.jpg bytes');
   await writeFile(path.join(inputs, 'fake.jpg'), bytes);
@@ -288,7 +290,7 @@ test('default CLI plan hashes InputImages without config, a helper, or any acces
   // Child processes are denied and outside paths (including the real private
   // helper directory and Photos library) are inaccessible in this subprocess.
   assert.match(stdout, /fake\.jpg/);
-  assert.deepEqual((await readdir(directory)).sort(), ['InputImages', 'artifacts', 'scripts']);
+  assert.deepEqual((await readdir(directory)).sort(), ['InputImages', 'artifacts', 'config.example.json', 'scripts']);
   const artifacts = path.join(directory, 'artifacts');
   const names = await readdir(artifacts);
   assert.equal(names.length, 1);

@@ -23,7 +23,8 @@ async function fixture(t) {
     if (filename.endsWith('.mjs')) await copyFile(new URL(`../scripts/${filename}`, import.meta.url), path.join(scripts, filename));
   }
   await copyFile(new URL('../scripts/bridge.mjs', import.meta.url), path.join(scripts, 'storage.mjs'));
-  await copyFile(new URL('../config.example.json', import.meta.url), path.join(directory, 'config.example.json'));
+  const defaults = await read(new URL('../config.example.json', import.meta.url));
+  await write(path.join(directory, 'config.example.json'), { ...defaults, albumName: null });
   for (const name of ['a.jpg', 'b.jpg', 'c.jpg']) await writeFile(path.join(input, name), `synthetic bytes ${name}`);
   await writeFile(path.join(scripts, 'bridge.mjs'), `
 import { existsSync } from 'node:fs';
@@ -42,13 +43,22 @@ const libraryPath=path.join(root,'library.json');
 export const record=async data=>appendFile(path.join(root,'calls.jsonl'),JSON.stringify(data)+'\\n');
 export async function startBridge(){
  await record({action:'startBridge'});
- return {accessibility:true,postEvents:true,screenCapture:true,photos:'authorized',capabilities:['input-images-batch-v1']};
+ return {accessibility:true,postEvents:true,screenCapture:true,photos:'authorized',capabilities:['input-images-batch-v1','clone-reframe-album-v1']};
 }
 export function createBridge({onRequest}={}){return {async call(action,args={}){
  const request={id:randomUUID(),action,args};await onRequest?.(request);await record({action,args});
  if(action==='activate')return {};
  if(action==='snapshot')return {nodes:[],frontmost:true,appPid:123,truncated:false,window:{title:'Photos',rect:{x:0,y:0,width:1000,height:800}}};
  const library=existsSync(libraryPath)?await readJSON(libraryPath):{albums:[],edited:[]};
+ if(action==='cloneAlbum'){
+   const source=library.albums.find(album=>album.id===args.sourceAlbumID);
+   const album={id:'copy-'+library.albums.length,name:args.albumName};
+   const sourceItems=args.items.map(item=>({...item,sha256:'a'.repeat(64),bytes:100}));
+   const imports=args.items.map((item,index)=>({item:{...item,id:album.id+'-asset-'+index},sourceSHA256:'a'.repeat(64)}));
+   library.albums.push({...album,items:imports.map(entry=>entry.item)});await atomicJSON(libraryPath,library);
+   if(existsSync(path.join(root,'uncertain-clone')))throw new Error('simulated lost clone reply');
+   return {album,sourceAlbum:{id:source.id,name:source.name},sourceItems,imports};
+ }
  if(action==='importImages'){
    const album={id:'album-'+(library.albums.length+1),name:args.albumName};
    const imports=args.files.map((source,index)=>({item:{id:album.id+'-asset-'+index,filename:source.filename,width:1440,height:1800},sourceSHA256:source.sha256}));
@@ -57,6 +67,7 @@ export function createBridge({onRequest}={}){return {async call(action,args={}){
    if(existsSync(path.join(root,'stop-during-import')))await atomicJSON(path.join(root,'artifacts/STOP'),{});
    return {album,imports};
  }
+ if(action==='albums')return {albums:library.albums.map(({id,name})=>({id,name}))};
  if(action==='albumItems'){
   const album=library.albums.find(album=>album.id===args.id);if(!album)throw new Error('missing test album');
   return {id:album.id,items:[...album.items].reverse()};
@@ -222,4 +233,77 @@ test('resume with no recorded batch refuses to import', async t => {
   const f = await fixture(t);
   await assert.rejects(() => f.invoke('resume'), error => /작업 기록이 없습니다/.test(error.stderr));
   assert.equal((await f.calls()).filter(call => call.action === 'importImages').length, 0);
+});
+
+
+
+async function withSourceAlbum(t) {
+  const f = await fixture(t);
+  await rm(f.input, { recursive: true });
+  const album = { id: 'source-album', name: 'Reframe', items: ['a', 'b', 'c'].map(id => ({ id, filename: id + '.jpg', width: 600, height: 800 })) };
+  await write(path.join(f.directory, 'library.json'), { albums: [album], edited: [] });
+  const config = await read(path.join(f.directory, 'config.example.json'));
+  await write(path.join(f.directory, 'config.json'), { ...config, albumName: 'Reframe' });
+  return { ...f, album };
+}
+
+test('Reframe plan reads only source; run clones all photos once, edits only copies, resumes and completes', async t => {
+  const f = await withSourceAlbum(t);
+  await f.invoke('plan');
+  assert.equal((await f.calls()).filter(c => ['snapshot','selection','process','importImages','cloneAlbum'].includes(c.action)).length, 0);
+  await f.invoke('run', '--limit', '1');
+  await f.invoke('resume', '--limit', '1');
+  await f.invoke('run');
+  const completed = await f.invoke('run');
+  assert.match(completed.stdout, /이미 모든 사진을 처리했습니다/);
+  let calls = await f.calls();
+  assert.deepEqual(calls.filter(c => c.action === 'process').map(c => c.item.id), ['copy-1-asset-0','copy-1-asset-1','copy-1-asset-2']);
+  assert.equal(calls.filter(c => c.action === 'cloneAlbum').length, 1);
+  assert.equal(calls.find(c => c.action === 'cloneAlbum').args.items.length, 3);
+  assert.match(calls.find(c => c.action === 'cloneAlbum').args.albumName, /^Reframe-\d{8}-\d{6}-\d{3}$/);
+  assert.equal(calls.filter(c => c.action === 'importImages').length, 0);
+  assert.equal((await readdir(path.join(f.directory, 'artifacts'))).filter(n => n.startsWith('photos-')).length, 1);
+  let library = await read(path.join(f.directory, 'library.json'));
+  assert.deepEqual(library.albums[0], f.album);
+  assert.ok(library.edited.every(id => !f.album.items.some(item => item.id === id)));
+  await f.invoke('run', '--new-run', '--limit', '1');
+  assert.equal((await f.calls()).filter(c => c.action === 'cloneAlbum').length, 2);
+  library = await read(path.join(f.directory, 'library.json'));
+  assert.equal(library.albums.length, 3);
+  assert.deepEqual(library.albums[0], f.album);
+});
+
+test('missing or duplicate Reframe never creates or processes copies', async t => {
+  const f = await withSourceAlbum(t);
+  for (const albums of [[], [f.album, {...f.album,id:'other'}]]) {
+    await write(path.join(f.directory,'library.json'), {albums,edited:[]});
+    await assert.rejects(() => f.invoke('run'), e => /앨범이 없습니다|앨범이 여러 개/.test(e.stderr));
+  }
+  assert.equal((await f.calls()).filter(c => ['process','cloneAlbum','importImages'].includes(c.action)).length, 0);
+});
+
+test('lost clone reply preserves intent and cannot clone again on run or resume', async t => {
+  const f = await withSourceAlbum(t);
+  await writeFile(path.join(f.directory,'uncertain-clone'),'1');
+  await assert.rejects(() => f.invoke('run'), e => /lost clone reply/.test(e.stderr));
+  await rm(path.join(f.directory,'uncertain-clone'));
+  for (const action of ['run','resume']) await assert.rejects(() => f.invoke(action), e => /사본을 자동으로 다시 만들지 않습니다/.test(e.stderr));
+  assert.equal((await f.calls()).filter(c => c.action === 'cloneAlbum').length, 1);
+  assert.equal((await f.calls()).filter(c => c.action === 'process').length, 0);
+});
+
+test('modified copy membership stops resume before editing; source additions do not change an existing copied plan', async t => {
+  const f = await withSourceAlbum(t);
+  await f.invoke('run','--limit','1');
+  const file = path.join(f.directory,'library.json');
+  let library = await read(file);
+  library.albums[0].items.push({id:'new-source',filename:'new.jpg',width:600,height:800});
+  await write(file,library);
+  await f.invoke('resume','--limit','1');
+  library = await read(file);
+  library.albums[1].items.push({id:'wrong-copy',filename:'foreign.jpg',width:600,height:800});
+  await write(file,library);
+  await assert.rejects(() => f.invoke('resume'), e => /작업 앨범을 확인하지 못했습니다/.test(e.stderr));
+  assert.equal((await f.calls()).filter(c => c.action === 'process').length, 2);
+  assert.equal((await f.calls()).filter(c => c.action === 'cloneAlbum').length, 1);
 });

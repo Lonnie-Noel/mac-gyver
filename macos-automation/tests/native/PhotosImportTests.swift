@@ -22,6 +22,32 @@ struct PhotosImportTests {
             precondition(CGImageDestinationFinalize(destination))
             return data as Data
         }
+        let cloneSource: [[String: Any]] = [["id": "source", "filename": "photo.jpg", "sha256": "abc"]]
+        let goodClone: [[String: Any]] = [["item": ["id": "copy", "filename": "photo.jpg"], "sourceSHA256": "abc"]]
+        try validateCloneReceipt(sourceItems: cloneSource, imports: goodClone)
+        for invalid: [[String: Any]] in [[], [["item": ["id": "source", "filename": "photo.jpg"], "sourceSHA256": "abc"]], [["item": ["id": "copy", "filename": "other.jpg"], "sourceSHA256": "abc"]], [["item": ["id": "copy", "filename": "photo.jpg"], "sourceSHA256": "wrong"]]] {
+            do { try validateCloneReceipt(sourceItems: cloneSource, imports: invalid); fatalError("invalid clone accepted") }
+            catch { precondition(error is PhotosImportFailure) }
+        }
+        precondition(validImportAlbumName("Reframe-20260921-153000-123"))
+        precondition(!validImportAlbumName("Reframe"))
+        precondition(!validImportAlbumName("Reframe-other"))
+        let cloneBytes: Data = try await withCheckedThrowingContinuation { continuation in
+            let completion = CloneResourceCompletion(continuation)
+            completion.receive(Data([1, 2])); completion.receive(Data([3])); completion.complete(nil); completion.complete(nil)
+        }
+        precondition(cloneBytes == Data([1, 2, 3]))
+        for variant in ["empty", "network", "timeout"] {
+            do {
+                let _: Data = try await withCheckedThrowingContinuation { continuation in
+                    let completion = CloneResourceCompletion(continuation)
+                    if variant == "timeout" { precondition(completion.expire()); precondition(!completion.expire()); completion.receive(Data([4])); completion.complete(nil) }
+                    else { completion.complete(variant == "network" ? NSError(domain: "clone", code: 1) : nil) }
+                }
+                fatalError("invalid clone stream accepted")
+            } catch {}
+        }
+        print("Independent clone IDs, byte receipts and bounded source streams validated")
         let jpeg = encoded(.jpeg)
         let metadataSource = CGImageSourceCreateWithData(jpeg as CFData, nil)!
         let metadata = CGImageSourceCopyPropertiesAtIndex(metadataSource, 0, nil) as! [CFString: Any]

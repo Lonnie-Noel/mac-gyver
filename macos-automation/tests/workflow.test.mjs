@@ -1051,3 +1051,34 @@ test('recovered-without-result completion also keeps pending until the manifest 
   await workflow.recover(await pending());
   assert.equal(await pending(), null);
 });
+
+
+test('pre-edit inspection retries a transient coherent-read failure without replaying input', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  let reads = 0;
+  env.hook = async action => { if (action === 'inspect' && ++reads === 1) throw new Error('검사 중 사진이 변경되었습니다.'); };
+  const baseline = await workflow.inspectBeforeEditing(ITEM);
+  assert.equal(baseline.assetId, ITEM.id);
+  assert.equal(reads, 2);
+  assert.equal(await pending(), null);
+  assert.ok(env.calls.every(c => ['snapshot', 'selection', 'inspect'].includes(c.action)));
+});
+
+test('pre-edit repeated changes stop after three reads; unrelated errors are not retried', async t => {
+  for (const [message, count] of [['검사 중 사진이 변경되었습니다.', 3], ['권한 오류', 1]]) {
+    const { workflow, env, pending } = await fixture(t);
+    env.hook = async action => { if (action === 'inspect') throw new Error(message); };
+    await assert.rejects(() => workflow.inspectBeforeEditing(ITEM), { message });
+    assert.equal(callsFor(env, 'inspect').length, count);
+    assert.equal(await pending(), null);
+    assert.ok(env.calls.every(c => ['snapshot', 'selection', 'inspect'].includes(c.action)));
+  }
+});
+
+test('pre-edit retry refuses a changed selection before reading or editing it', async t => {
+  const { workflow, env } = await fixture(t);
+  env.hook = async action => { if (action === 'inspect') { env.selected.id = 'other'; throw new Error('검사 중 사진이 변경되었습니다.'); } };
+  await assert.rejects(() => workflow.inspectBeforeEditing(ITEM), /선택한 사진/);
+  assert.equal(callsFor(env, 'inspect').length, 1);
+  assert.equal(callsFor(env, 'press').length, 0);
+});

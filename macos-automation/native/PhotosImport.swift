@@ -165,6 +165,10 @@ actor PhotosImport {
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
             throw PhotosImportFailure("사진 전체 접근 권한이 필요합니다. 권한 설정을 먼저 완료하세요.")
         }
+        return try await performImportImages(args)
+    }
+
+    private func performImportImages(_ args: [String: Any]) async throws -> [String: Any] {
         // Validate and stage one source at a time. No all-images Data array is
         // retained, and no PhotoKit request starts until EVERY source is ready.
         return try await withStagedImportBatch(args, directory: stateDirectory) { intent, stages in
@@ -233,6 +237,94 @@ actor PhotosImport {
                 try store.save(completed)
                 return result
             } catch { throw uncertain(error.localizedDescription) }
+        }
+    }
+
+    /// A test album must own independent asset IDs, not references to the source.
+    /// Download source resources read-only, then reuse the proven single batch
+    /// transaction and byte verification. Never replay an uncertain clone.
+    func cloneAlbum(_ args: [String: Any]) async throws -> [String: Any] {
+        guard !busy else { throw PhotosImportFailure("다른 사진 복사 작업이 진행 중입니다.") }
+        busy = true
+        defer { busy = false }
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized,
+              let runID = args["runID"] as? String, UUID(uuidString: runID) != nil,
+              let albumName = args["albumName"] as? String,
+              albumName.range(of: "^Reframe-[0-9]{8}-[0-9]{6}-[0-9]{3}$", options: .regularExpression) != nil,
+              let sourceID = args["sourceAlbumID"] as? String,
+              let rows = args["items"] as? [[String: Any]], !rows.isEmpty, rows.count <= 10_000 else {
+            throw PhotosImportFailure("앨범 복사 요청 또는 사진 전체 접근 권한이 유효하지 않습니다.")
+        }
+        let ids = rows.compactMap { $0["id"] as? String }
+        guard ids.count == rows.count, Set(ids).count == ids.count else {
+            throw PhotosImportFailure("원본 앨범 사진 ID가 없거나 중복됩니다.")
+        }
+        let store = ImportLedgerStore(directory: stateDirectory, runID: UUID(uuidString: runID)!.uuidString)
+        guard try store.load() == nil else { throw uncertain("이 실행의 앨범 복사 요청 기록이 이미 있습니다.") }
+        let collections = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [sourceID], options: nil)
+        guard collections.count == 1, let source = collections.firstObject,
+              source.localIdentifier == sourceID, source.localizedTitle == "Reframe", source.assetCollectionType == .album else {
+            throw PhotosImportFailure("정확한 Reframe 원본 앨범을 찾지 못했습니다.")
+        }
+        func sourceAssets() throws -> [PHAsset] {
+            let options = PHFetchOptions(); options.includeHiddenAssets = true
+            let fetched = PHAsset.fetchAssets(in: source, options: options)
+            var byID: [String: PHAsset] = [:]
+            fetched.enumerateObjects { asset, _, _ in byID[asset.localIdentifier] = asset }
+            guard fetched.count == ids.count, Set(byID.keys) == Set(ids) else {
+                throw PhotosImportFailure("복사 준비 중 Reframe 앨범 구성이 바뀌었습니다.")
+            }
+            return try ids.enumerated().map { index, id in
+                let asset = byID[id]!
+                let resources = PHAssetResource.assetResources(for: asset)
+                let originals = resources.filter { $0.type == .photo }
+                guard asset.mediaType == .image, !asset.mediaSubtypes.contains(.photoLive),
+                      !asset.hasAdjustments, !resources.contains(where: { $0.type == .adjustmentData }),
+                      originals.count == 1, originals[0].originalFilename == rows[index]["filename"] as? String else {
+                    throw PhotosImportFailure("Reframe에는 편집하지 않은 일반 정지 사진만 넣어 주세요. 동영상·Live Photo·기존 편집 사진은 복사 전에 중단합니다.")
+                }
+                return asset
+            }
+        }
+        let assets = try sourceAssets()
+        var stages: [ImportStagedFile] = []
+        defer { stages.forEach { $0.remove() } }
+        var files: [[String: Any]] = [], sourceItems: [[String: Any]] = []
+        for asset in assets {
+            let resource = PHAssetResource.assetResources(for: asset).first { $0.type == .photo }!
+            let data = try await cloneResourceData(resource)
+            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            let stage = try ImportStagedFile(data: data, filename: resource.originalFilename, parent: stateDirectory)
+            stages.append(stage)
+            files.append(["path": stage.url.path, "filename": resource.originalFilename, "sha256": hash, "bytes": data.count])
+            sourceItems.append(["id": asset.localIdentifier, "filename": resource.originalFilename, "sha256": hash, "bytes": data.count])
+        }
+        // Discard stale preparation rather than copying a different revision.
+        let fresh = try sourceAssets()
+        guard zip(assets, fresh).allSatisfy({ $0.modificationDate == $1.modificationDate }) else {
+            throw PhotosImportFailure("복사 준비 중 원본 사진 상태가 변경되었습니다. 아직 복사하지 않았습니다.")
+        }
+        var result = try await performImportImages(["runID": runID, "albumName": albumName, "files": files])
+        guard let imports = result["imports"] as? [[String: Any]],
+              let copiedAlbum = result["album"] as? [String: Any], copiedAlbum["id"] as? String != sourceID else {
+            throw uncertain("독립된 작업 앨범 ID를 확인하지 못했습니다.")
+        }
+        try validateCloneReceipt(sourceItems: sourceItems, imports: imports)
+        result["sourceAlbum"] = ["id": sourceID, "name": "Reframe"]
+        result["sourceItems"] = sourceItems
+        return result
+    }
+
+    private func cloneResourceData(_ resource: PHAssetResource) async throws -> Data {
+        let manager = PHAssetResourceManager.default()
+        let options = PHAssetResourceRequestOptions(); options.isNetworkAccessAllowed = true
+        return try await withCheckedThrowingContinuation { continuation in
+            let completion = CloneResourceCompletion(continuation)
+            let requestID = manager.requestData(for: resource, options: options,
+                dataReceivedHandler: { completion.receive($0) }, completionHandler: { completion.complete($0) })
+            DispatchQueue.global().asyncAfter(deadline: .now() + 180) {
+                if completion.expire() { manager.cancelDataRequest(requestID) }
+            }
         }
     }
 
@@ -378,7 +470,7 @@ private final class ImportResourceCompletion: @unchecked Sendable {
 private func withStagedImportBatch<T>(_ args: [String: Any], directory: URL,
     operation: (ImportLedger, [ImportStagedFile]) async throws -> T) async throws -> T {
     guard let rawRunID = args["runID"] as? String, let runID = UUID(uuidString: rawRunID),
-          let albumName = args["albumName"] as? String, albumName.hasPrefix("MacGyver"), albumName.utf8.count <= 256,
+          let albumName = args["albumName"] as? String, validImportAlbumName(albumName), albumName.utf8.count <= 256,
           !albumName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
           let files = args["files"] as? [[String: Any]], !files.isEmpty, files.count <= 10_000 else {
         throw PhotosImportFailure("일괄 가져오기 실행 ID·앨범 이름·파일 목록이 올바르지 않습니다 (1~10,000장).")
@@ -495,7 +587,7 @@ private struct ImportStagedFile {
 
 private func importInput(_ args: [String: Any]) throws -> ImportInput {
     guard let rawRunID = args["runID"] as? String, let runID = UUID(uuidString: rawRunID),
-          let albumName = args["albumName"] as? String, albumName.hasPrefix("MacGyver"), albumName.utf8.count <= 256,
+          let albumName = args["albumName"] as? String, validImportAlbumName(albumName), albumName.utf8.count <= 256,
           !albumName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
           let path = args["path"] as? String, path.hasPrefix("/"), !path.utf8.contains(0),
           let filename = args["filename"] as? String, !filename.isEmpty, filename.utf8.count <= 255,
@@ -619,5 +711,56 @@ private struct ImportLedgerStore: Sendable {
             guard Darwin.rename(temporary.path, url.path) == 0 else { throw PhotosImportFailure("가져오기 기록을 확정하지 못했습니다.") }
         }
         guard fsync(directoryFD) == 0 else { throw PhotosImportFailure("가져오기 상태 폴더를 디스크에 동기화하지 못했습니다.") }
+    }
+}
+
+
+private func validImportAlbumName(_ name: String) -> Bool {
+    name.hasPrefix("MacGyver") || name.range(of: "^Reframe-[0-9]{8}-[0-9]{6}-[0-9]{3}$", options: .regularExpression) != nil
+}
+
+private func validateCloneReceipt(sourceItems: [[String: Any]], imports: [[String: Any]]) throws {
+    let sourceIDs = Set(sourceItems.compactMap { $0["id"] as? String })
+    var copyIDs = Set<String>()
+    guard sourceIDs.count == sourceItems.count, imports.count == sourceItems.count else {
+        throw PhotosImportFailure("사진 복사 개수와 원본 기록이 다릅니다.")
+    }
+    for (index, entry) in imports.enumerated() {
+        guard let item = entry["item"] as? [String: Any], let id = item["id"] as? String,
+              !sourceIDs.contains(id), copyIDs.insert(id).inserted,
+              item["filename"] as? String == sourceItems[index]["filename"] as? String,
+              let hash = entry["sourceSHA256"] as? String, hash == sourceItems[index]["sha256"] as? String else {
+            throw PhotosImportFailure("사진 사본의 독립된 ID·원본 파일명·바이트 해시가 일치하지 않습니다.")
+        }
+    }
+}
+
+private final class CloneResourceCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var data = Data()
+    private var oversized = false
+    init(_ continuation: CheckedContinuation<Data, Error>) { self.continuation = continuation }
+    func receive(_ chunk: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard continuation != nil, !oversized else { return }
+        if data.count + chunk.count > 512 * 1024 * 1024 { oversized = true; data.removeAll(); return }
+        data.append(chunk)
+    }
+    func complete(_ error: Error?) {
+        lock.lock()
+        let pending = continuation; continuation = nil
+        let result = data; data.removeAll()
+        let invalid = oversized || result.isEmpty
+        lock.unlock()
+        guard let pending else { return }
+        if let error { pending.resume(throwing: error) }
+        else if invalid { pending.resume(throwing: PhotosImportFailure("복사 원본은 0바이트보다 크고 512MB 이하이어야 합니다.")) }
+        else { pending.resume(returning: result) }
+    }
+    func expire() -> Bool {
+        lock.lock(); let pending = continuation; continuation = nil; data.removeAll(); lock.unlock()
+        pending?.resume(throwing: PhotosImportFailure("원본 사진 다운로드가 180초 안에 끝나지 않았습니다."))
+        return pending != nil
     }
 }
