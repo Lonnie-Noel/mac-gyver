@@ -5,11 +5,12 @@ import ScreenCaptureKit
 import Darwin
 
 @MainActor
-final class BridgeAppDelegate: NSObject, NSApplicationDelegate {
+final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var timer: Timer?
     private var busy = false
     private var window: NSWindow?
     private var statusLabel: NSTextField?
+    private var statusItem: NSStatusItem?
     private let ui = PhotosUI()
     private var media: PhotosMedia!
     private var root: URL!
@@ -36,10 +37,40 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate {
             timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
                 Task { @MainActor in await self?.processNext() }
             }
+            installStatusMenu()
+            if !arguments.contains("--background") { showSetup() }
         } catch {
             showSetup()
             statusLabel?.stringValue = "시작 오류: \(error.localizedDescription)"
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showSetup()
+        return true
+    }
+
+    private func installStatusMenu() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "사진 자동화"
+        item.button?.toolTip = "Mac 사진 자동화 설정 및 종료"
+        let menu = NSMenu()
+        let settings = NSMenuItem(title: "설정 창 열기", action: #selector(openSetup), keyEquivalent: "")
+        settings.target = self
+        menu.addItem(settings)
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "보조 앱 종료", action: #selector(quitHelper), keyEquivalent: "")
+        quit.target = self
+        menu.addItem(quit)
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc private func openSetup() { showSetup() }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
     }
 
     private func status() -> [String: Any] {
@@ -121,9 +152,11 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSetup() {
         if let window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refreshStatus(); return }
-        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 610, height: 410),
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 610, height: 460),
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.title = "Mac 사진 자동화 설정"
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
         stack.translatesAutoresizingMaskIntoConstraints = false
         let title = NSTextField(labelWithString: "Mac 사진 자동화 권한")
@@ -132,7 +165,8 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(explanation)
         let label = NSTextField(wrappingLabelWithString: ""); label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         stack.addArrangedSubview(label); statusLabel = label
-        for (title, action) in [("권한 요청", #selector(requestPermissions)), ("상태 새로고침", #selector(refreshStatus)), ("설정 창 닫기", #selector(closeSetup)), ("보조 앱 종료", #selector(quitHelper))] {
+        stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "창을 숨겨도 메뉴 막대의 ‘사진 자동화 → 설정 창 열기’에서 다시 열 수 있습니다. 앱을 다시 실행하거나 설정 커맨드를 실행해도 열립니다."))
+        for (title, action) in [("권한 요청", #selector(requestPermissions)), ("상태 새로고침", #selector(refreshStatus)), ("설정 창 숨기기", #selector(closeSetup)), ("보조 앱 종료", #selector(quitHelper))] {
             let button = NSButton(title: title, target: self, action: action); stack.addArrangedSubview(button)
         }
         panel.contentView?.addSubview(stack)

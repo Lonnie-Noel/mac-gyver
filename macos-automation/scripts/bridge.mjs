@@ -97,11 +97,21 @@ export function createBridge({ base = ipcRoot, timeoutMs = 600_000, onRequest } 
 export async function startBridge() {
   if (process.platform !== 'darwin') throw new Error('macOS 전용 자동화입니다.');
   if (!existsSync(path.join(appPath, 'Contents/MacOS/MacPhotosBridge'))) throw new Error('보조 앱이 없습니다. 먼저 npm run build 또는 설정 파일을 실행하세요.');
-  await execute('/usr/bin/open', ['-g', appPath], { timeout: 15_000 });
+  // Reopening the app explicitly shows its settings window. Automation should
+  // reuse the running helper without sending a reopen event or stealing focus.
+  if (!await bridgeIsRunning()) {
+    await execute('/usr/bin/open', ['-g', appPath, '--args', '--background'], { timeout: 15_000 });
+  }
   const bridge = createBridge({ timeoutMs: 30_000 });
   const status = await bridge.call('status');
   if (status.protocolVersion !== 2 || await realpath(status.executable) !== await realpath(path.join(appPath, 'Contents/MacOS/MacPhotosBridge'))) {
     throw new Error('다른 위치/버전의 보조 앱이 실행 중입니다. 기존 MacPhotosBridge를 종료한 뒤 다시 실행하세요.');
   }
   return status;
+}
+
+export async function bridgeIsRunning() {
+  const { stdout } = await execute('/bin/ps', ['-ax', '-o', 'comm='], { timeout: 10_000 });
+  const executable = path.join(appPath, 'Contents/MacOS/MacPhotosBridge');
+  return stdout.split('\n').some(line => line.trim() === executable);
 }

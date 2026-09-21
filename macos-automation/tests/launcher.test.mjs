@@ -150,7 +150,7 @@ test('an empty PATH fixture can select an explicitly supplied supported fallback
 
 test('all Finder launchers preserve their action and arguments and the one-photo launcher ends with --limit 1', async t => {
   for (const [filename, action, build, single] of [
-    ['Mac 사진 자동화 설정.command', 'setup', true, false],
+    ['Mac 사진 자동화 설정.command', 'setup', false, false],
     ['Mac 사진 자동화 시작.command', 'run', false, false],
     ['Mac 사진 자동화 1장 테스트.command', 'run', false, true],
     ['Mac 사진 자동화 중지.command', 'stop', false, false],

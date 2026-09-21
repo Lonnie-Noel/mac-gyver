@@ -6,6 +6,7 @@ import { createBridge, startBridge, root, ipcRoot, atomicJSON, readJSON, private
 import { readUI, rotateItems, validateConfig } from './core.mjs';
 import { PhotoWorkflow } from './workflow.mjs';
 import { requireNodeVersion } from './runtime.mjs';
+import { openSettings } from './setup.mjs';
 const artifacts=path.join(root,'artifacts'), pendingPath=path.join(artifacts,'pending-edit.json'), stopPath=path.join(artifacts,'STOP'), activePath=path.join(artifacts,'active-run.json'), leasePath=path.join(ipcRoot,'workflow-lock.json');
 const alive=pid=>{if(!Number.isSafeInteger(pid)||pid<1)return false;try{process.kill(pid,0);return true;}catch(e){return e.code==='EPERM';}};
 export function argumentsFor(argv) {
@@ -35,8 +36,7 @@ export async function makePlan(bridge,config){
 async function stop(){await privateDirectory(artifacts);if(!existsSync(activePath)){console.log('실행 중인 Mac 사진 작업이 없습니다.');return;}const active=await readJSON(activePath);if(!alive(active.pid)){console.log('실행 프로세스는 종료됐습니다. 미완료 기록이 있으면 recover를 실행하세요.');return;}await atomicJSON(stopPath,{requestedAt:new Date().toISOString()});console.log('중지를 요청했습니다. 진행 중인 요청 종료 후 멈춥니다.');}
 async function main(){
   requireNodeVersion();
-  const options=argumentsFor(process.argv.slice(2));if(options.action==='stop')return stop();const config=await configuration(options),status=await startBridge(),bridge=createBridge();
-  if(options.action==='setup'){await bridge.call('showSetup');console.log('설정 창을 열었습니다. 권한 요청 버튼을 눌러 macOS 안내를 따르세요.');return;}
+  const options=argumentsFor(process.argv.slice(2));if(options.action==='stop')return stop();if(options.action==='setup')return openSettings();const config=await configuration(options),status=await startBridge(),bridge=createBridge();
   if(options.action==='check'){console.log(JSON.stringify(status,null,2));requirePermissions(status);await bridge.call('selection');console.log('보조 앱·권한·사진 ID 조회 확인 완료. 사진은 변경하지 않았습니다.');return;}
   requirePermissions(status);
   if(options.action==='albums'){console.log(JSON.stringify(await bridge.call('albums'),null,2));return;}
