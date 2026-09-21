@@ -191,7 +191,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             row.addArrangedSubview(requestButton); row.addArrangedSubview(settingsButton)
             stack.addArrangedSubview(row)
         }
-        let notice = NSTextField(wrappingLabelWithString: "화면 기록 목록에 앱이 없으면 요청 버튼을 누른 뒤 설정에서 +로 앱을 추가하세요. ‘현재 앱 Finder에서 보기’로 실제 앱 위치를 확인할 수 있습니다.")
+        let notice = NSTextField(wrappingLabelWithString: "‘요청’은 macOS 권한 안내만 요청합니다. 팝업이 나타나지 않을 때 옆의 ‘설정 열기’를 누르세요. 화면 기록 목록에 앱이 없으면 +로 추가할 수 있습니다.")
         notice.font = .systemFont(ofSize: 12)
         notice.heightAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
         stack.addArrangedSubview(notice); permissionNoticeLabel = notice
@@ -230,16 +230,14 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard permissionActionAllowed() else { return }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         let granted = AXIsProcessTrustedWithOptions(options)
-        permissionNoticeLabel?.stringValue = granted ? "손쉬운 사용이 허용되어 있습니다." : "손쉬운 사용 설정에서 이 도우미를 켜세요. 이전 앱 항목이 남아 있으면 권한 초기화 후 다시 등록하세요."
-        if !granted { openPrivacySettings("Privacy_Accessibility") }
+        permissionNoticeLabel?.stringValue = granted ? "손쉬운 사용이 허용되어 있습니다." : "macOS 권한 안내를 확인하세요. 팝업이 없으면 옆의 ‘손쉬운 사용 설정 열기’를 눌러 이 도우미를 켜세요."
         refreshStatus()
     }
 
     @objc private func requestScreenCapture() {
         guard permissionActionAllowed() else { return }
         let granted = CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess()
-        permissionNoticeLabel?.stringValue = granted ? "화면 기록이 허용되어 있습니다." : "화면 기록 요청을 보냈습니다. 팝업이 없으면 열린 설정에서 이 앱을 켜거나 +로 추가하세요. 변경 후 보조 앱을 종료하고 다시 실행하세요."
-        if !granted { openPrivacySettings("Privacy_ScreenCapture") }
+        permissionNoticeLabel?.stringValue = granted ? "화면 기록이 허용되어 있습니다." : "macOS 권한 안내를 확인하세요. 팝업이 없으면 옆의 ‘화면 기록 설정 열기’를 누르세요. 변경 후에는 도우미 재시작이 필요할 수 있습니다."
         refreshStatus()
     }
 
@@ -249,8 +247,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         Task { @MainActor in
             defer { permissionBusy = false }
             let authorization = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-            permissionNoticeLabel?.stringValue = authorization == .authorized ? "사진 전체 접근이 허용되어 있습니다." : "사진 설정에서 이 도우미의 전체 접근을 허용하세요. 제한된 사진 선택으로는 자동화를 실행할 수 없습니다."
-            if authorization != .authorized { openPrivacySettings("Privacy_Photos") }
+            permissionNoticeLabel?.stringValue = authorization == .authorized ? "사진 전체 접근이 허용되어 있습니다." : "사진 전체 접근이 필요합니다. 변경하려면 옆의 ‘사진 전체 접근 설정 열기’를 누르세요. 제한된 사진 선택으로는 자동화를 실행할 수 없습니다."
             refreshStatus()
         }
     }
@@ -263,8 +260,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             _ = try PhotosScripting.handle("selection", args: [:])
             permissionNoticeLabel?.stringValue = "자동화 → 사진 접근을 확인했습니다. 사진은 변경하지 않았습니다."
         } catch {
-            permissionNoticeLabel?.stringValue = "자동화 → 사진 요청 결과: \(error.localizedDescription)\n설정에서 이 도우미 아래의 사진을 허용하세요."
-            openPrivacySettings("Privacy_Automation")
+            permissionNoticeLabel?.stringValue = "자동화 → 사진 요청 결과: \(error.localizedDescription)\n권한을 거부했다면 옆의 ‘자동화 → 사진 설정 열기’를 눌러 허용하세요."
         }
         refreshStatus()
     }
