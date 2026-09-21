@@ -6,11 +6,12 @@ import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { selectors, uniqueNode, readUI } from '../scripts/core.mjs';
 
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
 
-test('native AX reads tolerate only missing optional subrole and preserve critical failures', { skip: process.platform !== 'darwin' }, async t => {
+test('native AX reads tolerate optional subrole/description failure and preserve critical failures', { skip: process.platform !== 'darwin' }, async t => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'macgyver-ax-policy-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const executable = path.join(temp, 'ax-policy-tests');
@@ -19,4 +20,18 @@ test('native AX reads tolerate only missing optional subrole and preserve critic
     path.join(root, 'tests/native/AXReadPolicyTests.swift'), '-o', executable], { timeout: 120000 });
   const { stdout } = await execute(executable, [], { timeout: 10000 });
   assert.match(stdout, /regression checks passed/);
+});
+
+test('an omitted description cannot match the Tools action or prove Reframe readiness', () => {
+  const snapshot = {
+    window: { rect: { x: 0, y: 0, width: 800, height: 600 } },
+    nodes: [
+      { role: 'AXRadioButton', enabled: true },
+      { identifier: 'IPXEditModalCancelChanges', enabled: true },
+      { role: 'AXStaticText', enabled: true },
+    ],
+  };
+  assert.throws(() => uniqueNode(snapshot, selectors.tools), /\(0\)/);
+  assert.equal(readUI(snapshot).reframeReady, false);
+  assert.equal(readUI(snapshot).generated, false);
 });

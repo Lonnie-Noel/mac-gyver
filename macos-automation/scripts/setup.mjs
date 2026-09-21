@@ -32,6 +32,6 @@ export async function openSettings({
   }
   await build();
   await show();
-  log('설정 창을 열었습니다. 권한 요청 버튼을 눌러 macOS 안내를 따르세요.');
+  log('설정 창을 열었습니다. 네 권한을 하나씩 요청하세요. 재빌드 후 권한이 꼬였으면 이 앱 권한 초기화 후 종료를 누르고 설정 커맨드를 다시 실행하세요.');
   return 'ready';
 }
