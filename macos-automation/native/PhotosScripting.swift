@@ -15,12 +15,13 @@ enum PhotosScripting {
             _ = try run("activate\nreturn true")
             return ["activated": true]
         case "selection":
-            return ["items": try mediaRows(run("return my packedItems(selection)"))]
+            return ["items": try selectedItems(run("return selection"))]
         case "albums":
             let result = try run("""
                 set rows to {}
-                repeat with candidate in albums
-                    set end of rows to {(id of candidate) as text, (name of candidate) as text, false}
+                repeat with candidateReference in (get albums)
+                    set candidate to contents of candidateReference
+                    set end of rows to {(get id of candidate) as text, (get name of candidate) as text, false}
                 end repeat
                 set favoriteAlbum to favorites album
                 set end of rows to {(id of favoriteAlbum) as text, (name of favoriteAlbum) as text, true}
@@ -41,9 +42,10 @@ enum PhotosScripting {
             let result = try run("""
                 set wantedID to \(quoted(id))
                 set targetAlbum to missing value
-                repeat with candidate in albums
-                    if (id of candidate) as text is wantedID then
-                        set targetAlbum to contents of candidate
+                repeat with candidateReference in (get albums)
+                    set candidate to contents of candidateReference
+                    if (get id of candidate) as text is wantedID then
+                        set targetAlbum to candidate
                         exit repeat
                     end if
                 end repeat
@@ -52,7 +54,7 @@ enum PhotosScripting {
                     if (id of candidate) as text is wantedID then set targetAlbum to candidate
                 end if
                 if targetAlbum is missing value then error "요청한 앨범 ID를 찾을 수 없습니다."
-                return {(id of targetAlbum) as text, (name of targetAlbum) as text, my packedItems(media items of targetAlbum)}
+                return {(id of targetAlbum) as text, (name of targetAlbum) as text, my packedItems((get media items of targetAlbum))}
                 """)
             let fields = try list(result)
             guard fields.count == 3, try text(fields[0]) == id else {
@@ -67,9 +69,9 @@ enum PhotosScripting {
                 if (id of targetItem) as text is not wantedID then error "다른 사진 ID입니다."
                 activate
                 spotlight targetItem
-                return my packedItems(selection)
+                return selection
                 """)
-            let items = try mediaRows(result)
+            let items = try selectedItems(result)
             // spotlight may return before the selection animation completes.
             // The caller must poll selection until exactly this ID is selected.
             return ["id": id, "items": items,
@@ -79,17 +81,82 @@ enum PhotosScripting {
         }
     }
 
-    private static func run(_ body: String) throws -> NSAppleEventDescriptor {
-        let source = """
+    // Photos may return a selection object whose container is an internal smart
+    // album that AppleScript cannot resolve (-1728). The selection descriptor
+    // already carries the exact unique asset ID. Read that literal field without
+    // evaluating its container, then resolve the asset at the library root.
+    // Reject name/index/range references rather than guessing another photo.
+    private static func selectedIDs(_ descriptor: NSAppleEventDescriptor) throws -> [String] {
+        let mediaItemClass: OSType = 0x49506d69 // 'IPmi', Photos.sdef media item
+        let literalTextTypes: Set<DescType> = [typeUnicodeText, typeUTF8Text, typeChar]
+        var seen = Set<String>()
+        return try list(descriptor).map { reference in
+            guard reference.descriptorType == typeObjectSpecifier,
+                  let desiredClass = reference.forKeyword(AEKeyword(keyAEDesiredClass)),
+                  desiredClass.descriptorType == typeType,
+                  desiredClass.typeCodeValue == mediaItemClass,
+                  let form = reference.forKeyword(AEKeyword(keyAEKeyForm)),
+                  form.descriptorType == typeEnumerated, form.enumCodeValue == formUniqueID,
+                  let key = reference.forKeyword(AEKeyword(keyAEKeyData)),
+                  literalTextTypes.contains(key.descriptorType),
+                  let value = key.stringValue else {
+                throw PhotosScriptFailure("선택된 사진의 정확한 ID 참조를 확인할 수 없습니다.")
+            }
+            let id = try identifier(["id": value])
+            guard seen.insert(id).inserted else {
+                throw PhotosScriptFailure("선택된 사진 ID가 중복되어 있습니다.")
+            }
+            return id
+        }
+    }
+
+    private static func selectedItems(_ descriptor: NSAppleEventDescriptor) throws -> [[String: Any]] {
+        let ids = try selectedIDs(descriptor)
+        guard !ids.isEmpty else { return [] }
+        let idList = ids.map(quoted).joined(separator: ", ")
+        let result = try run("""
+            set rows to {}
+            repeat with idReference in {\(idList)}
+                set wantedID to contents of idReference
+                set targetItem to media item id wantedID
+                if (get id of targetItem) as text is not wantedID then error "다른 사진 ID입니다."
+                set itemRows to my packedItems({targetItem})
+                set end of rows to item 1 of itemRows
+            end repeat
+            return rows
+            """)
+        let items = try mediaRows(result)
+        guard items.count == ids.count,
+              zip(items, ids).allSatisfy({ $0.0["id"] as? String == $0.1 }) else {
+            throw PhotosScriptFailure("선택된 사진 ID와 조회된 사진 ID가 다릅니다.")
+        }
+        return items
+    }
+
+    // A repeat-with-in variable is a reference to item N of the local list, not
+    // the Photos object itself. Dereference before asking Photos for properties;
+    // selection can contain album-scoped objects and the extra list reference
+    // otherwise reaches Photos as an unresolvable property specifier (-1700).
+    private static let packedItemsHandler = """
             on packedItems(theItems)
                 set rows to {}
                 tell application id "com.apple.Photos"
-                    repeat with photoItem in theItems
-                        set end of rows to {(id of photoItem) as text, (filename of photoItem) as text, width of photoItem, height of photoItem}
+                    repeat with photoReference in theItems
+                        set photoItem to contents of photoReference
+                        set photoID to (get id of photoItem) as text
+                        set photoFilename to (get filename of photoItem) as text
+                        set photoWidth to (get width of photoItem)
+                        set photoHeight to (get height of photoItem)
+                        set end of rows to {photoID, photoFilename, photoWidth, photoHeight}
                     end repeat
                 end tell
                 return rows
             end packedItems
+            """
+
+    private static func run(_ body: String) throws -> NSAppleEventDescriptor {
+        let source = """
+            \(packedItemsHandler)
             with timeout of 30 seconds
                 tell application id "com.apple.Photos"
                     \(body)
