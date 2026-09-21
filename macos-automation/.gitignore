@@ -2,5 +2,7 @@
 /logs/
 /artifacts/
 /config.json
+/InputImages/*
+!/InputImages/README.md
 .DS_Store
 *.xcuserstate

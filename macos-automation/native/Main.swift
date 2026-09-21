@@ -13,6 +13,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var statusItem: NSStatusItem?
     private let ui = PhotosUI()
     private var media: PhotosMedia!
+    private var importer: PhotosImport!
     private var root: URL!
     private var currentID: String?
 
@@ -34,6 +35,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             }
             media = PhotosMedia(stateDirectory: root.appendingPathComponent("state"))
+            importer = PhotosImport(stateDirectory: root.appendingPathComponent("state"))
             timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
                 Task { @MainActor in await self?.processNext() }
             }
@@ -86,6 +88,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         return ["accessibility": AXIsProcessTrusted(), "postEvents": CGPreflightPostEventAccess(),
                 "screenCapture": CGPreflightScreenCaptureAccess(), "photos": photoStatus,
                 "busy": busy, "currentRequest": currentID ?? "", "protocolVersion": 2,
+                "capabilities": ["input-images-v1"],
                 "executable": Bundle.main.executableURL?.path ?? ""]
     }
 
@@ -146,6 +149,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "capture": return try await ui.capture(args)
         case "selection", "albums", "albumItems", "show", "activate": return try PhotosScripting.handle(action, args: args)
         case "inspect", "export", "revert", "verifyJPEG": return try await media.handle(action, args: args)
+        case "importImage": return try await importer.importImage(args)
         default: throw HostError("지원하지 않는 명령입니다: \(action)")
         }
     }
