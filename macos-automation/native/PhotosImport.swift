@@ -28,6 +28,9 @@ private struct ImportLedger: Codable {
     var albumName: String
     var albumID: String?
     var entries: [String: ImportEntry] = [:]
+    // Present only for the single-transaction batch protocol. Keep the source
+    // order explicitly; dictionary order and Photos album order are unrelated.
+    var orderedPaths: [String]?
 }
 
 private struct ImportInput {
@@ -61,6 +64,9 @@ actor PhotosImport {
         var ledger = previous ?? ImportLedger(runID: input.runID, albumName: input.albumName)
         guard ledger.version == 1, ledger.runID == input.runID, ledger.albumName == input.albumName else {
             throw PhotosImportFailure("가져오기 실행 기록과 요청한 앨범 정보가 다릅니다.")
+        }
+        guard ledger.orderedPaths == nil else {
+            throw uncertain("한 번에 가져온 실행에 개별 사진을 추가할 수 없습니다.")
         }
         guard ledger.entries.values.allSatisfy({ $0.state == "complete" }) else {
             throw uncertain("이 실행에 완료 여부가 확인되지 않은 가져오기 기록이 있습니다.")
@@ -149,6 +155,119 @@ actor PhotosImport {
                 try store.save(completed)
                 return result
             } catch { throw uncertain(error.localizedDescription) }
+        }
+    }
+
+    func importImages(_ args: [String: Any]) async throws -> [String: Any] {
+        guard !busy else { throw PhotosImportFailure("다른 사진 가져오기를 처리 중입니다.") }
+        busy = true
+        defer { busy = false }
+        guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
+            throw PhotosImportFailure("사진 전체 접근 권한이 필요합니다. 권한 설정을 먼저 완료하세요.")
+        }
+        // Validate and stage one source at a time. No all-images Data array is
+        // retained, and no PhotoKit request starts until EVERY source is ready.
+        return try await withStagedImportBatch(args, directory: stateDirectory) { intent, stages in
+            let store = ImportLedgerStore(directory: stateDirectory, runID: intent.runID)
+            if let previous = try store.load() {
+                try validateExistingBatchLedger(previous, requested: intent)
+                // A known-complete response can be reconstructed read-only;
+                // pending/uncertain batches are never automatically replayed.
+                return try await validatedBatchResult(previous)
+            }
+            try store.save(intent, exclusive: true)
+            let outcome = ImportTransactionOutcome()
+            do {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    PHPhotoLibrary.shared().performChanges {
+                        do {
+                            let albumRequest = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: intent.albumName)
+                            let albumID = albumRequest.placeholderForCreatedAssetCollection.localIdentifier
+                            let requests = stages.map { _ in PHAssetCreationRequest.forAsset() }
+                            let placeholders = try requests.map { request -> PHObjectPlaceholder in
+                                guard let placeholder = request.placeholderForCreatedAsset else {
+                                    throw PhotosImportFailure("새 사진 ID를 확인하지 못했습니다.")
+                                }
+                                return placeholder
+                            }
+                            let identified = try identifiedBatchLedger(intent, albumID: albumID,
+                                assetIDs: placeholders.map(\.localIdentifier))
+                            // Persist ALL exact placeholder IDs before adding
+                            // any resource. If preparation fails, retain intent
+                            // and never assume PhotoKit rolled back its block.
+                            try store.save(identified)
+                            for (index, stage) in stages.enumerated() {
+                                let options = PHAssetResourceCreationOptions()
+                                options.originalFilename = stage.url.lastPathComponent
+                                options.shouldMoveFile = false
+                                requests[index].addResource(with: .photo, fileURL: stage.url, options: options)
+                            }
+                            albumRequest.addAssets(placeholders as NSArray)
+                            outcome.prepared(identified)
+                        } catch { outcome.failed(error) }
+                    } completionHandler: { success, error in
+                        if let preparationError = outcome.snapshot().error {
+                            continuation.resume(throwing: preparationError)
+                        } else if let error { continuation.resume(throwing: error) }
+                        else if !success { continuation.resume(throwing: PhotosImportFailure("사진 보관함 일괄 가져오기 결과를 확인하지 못했습니다.")) }
+                        else { continuation.resume() }
+                    }
+                }
+                guard var completed = outcome.snapshot().ledger else {
+                    throw PhotosImportFailure("가져온 사진의 정확한 ID 기록이 없습니다.")
+                }
+                let result = try await validatedBatchResult(completed)
+                guard let imports = result["imports"] as? [[String: Any]],
+                      let paths = completed.orderedPaths, imports.count == paths.count else {
+                    throw PhotosImportFailure("일괄 가져오기 검증 응답이 유효하지 않습니다.")
+                }
+                for (index, path) in paths.enumerated() {
+                    guard let item = imports[index]["item"] as? [String: Any],
+                          let width = item["width"] as? Int, let height = item["height"] as? Int else {
+                        throw PhotosImportFailure("가져온 사진 크기 응답이 유효하지 않습니다.")
+                    }
+                    completed.entries[path]?.state = "complete"
+                    completed.entries[path]?.width = width
+                    completed.entries[path]?.height = height
+                }
+                try store.save(completed)
+                return result
+            } catch { throw uncertain(error.localizedDescription) }
+        }
+    }
+
+    private func validatedBatchResult(_ ledger: ImportLedger) async throws -> [String: Any] {
+        guard let paths = ledger.orderedPaths, !paths.isEmpty,
+              paths.count == ledger.entries.count, Set(paths).count == paths.count else {
+            throw PhotosImportFailure("일괄 가져오기 사진 순서 기록이 유효하지 않습니다.")
+        }
+        try verifyBatchMembership(ledger)
+        var imports: [[String: Any]] = []
+        for path in paths {
+            guard let entry = ledger.entries[path] else {
+                throw PhotosImportFailure("일괄 가져오기 기록에 입력 사진이 없습니다.")
+            }
+            let result = try await validatedResult(ledger, entry: entry)
+            imports.append(["item": result["item"]!, "sourceSHA256": result["sourceSHA256"]!])
+        }
+        // Hash validation can wait for iCloud, so also reject membership changes
+        // made during that interval before returning any editable photo IDs.
+        try verifyBatchMembership(ledger)
+        return ["album": ["id": ledger.albumID!, "name": ledger.albumName], "imports": imports]
+    }
+
+    private func verifyBatchMembership(_ ledger: ImportLedger) throws {
+        let album = try exactAlbum(ledger)
+        let ids = ledger.entries.values.compactMap(\.assetID)
+        guard ids.count == ledger.entries.count, Set(ids).count == ids.count else {
+            throw PhotosImportFailure("일괄 가져오기 사진 ID 기록이 유효하지 않습니다.")
+        }
+        let options = PHFetchOptions(); options.includeHiddenAssets = true
+        let assets = PHAsset.fetchAssets(in: album, options: options)
+        var actual = Set<String>()
+        assets.enumerateObjects { asset, _, _ in actual.insert(asset.localIdentifier) }
+        guard assets.count == ids.count, actual == Set(ids) else {
+            throw PhotosImportFailure("작업 앨범의 사진 ID 집합이 일괄 가져오기 기록과 다릅니다.")
         }
     }
 
@@ -250,6 +369,70 @@ private final class ImportResourceCompletion: @unchecked Sendable {
         lock.lock(); let pending = continuation; continuation = nil; lock.unlock()
         pending?.resume(throwing: PhotosImportFailure("가져온 원본 파일 검증 시간이 초과되었습니다."))
         return pending != nil
+    }
+}
+
+/// All stages stay alive across the single asynchronous PhotoKit transaction
+/// and its subsequent resource validation. Each decoded source/Data is released
+/// before reading the next source; only metadata and private URLs accumulate.
+private func withStagedImportBatch<T>(_ args: [String: Any], directory: URL,
+    operation: (ImportLedger, [ImportStagedFile]) async throws -> T) async throws -> T {
+    guard let rawRunID = args["runID"] as? String, let runID = UUID(uuidString: rawRunID),
+          let albumName = args["albumName"] as? String, albumName.hasPrefix("MacGyver"), albumName.utf8.count <= 256,
+          !albumName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+          let files = args["files"] as? [[String: Any]], !files.isEmpty, files.count <= 10_000 else {
+        throw PhotosImportFailure("일괄 가져오기 실행 ID·앨범 이름·파일 목록이 올바르지 않습니다 (1~10,000장).")
+    }
+    let paths = files.compactMap { $0["path"] as? String }
+    guard paths.count == files.count, Set(paths).count == paths.count else {
+        throw PhotosImportFailure("일괄 가져오기에는 각 원본 경로가 정확히 한 번만 있어야 합니다.")
+    }
+    var intent = ImportLedger(runID: runID.uuidString, albumName: albumName, orderedPaths: paths)
+    var stages: [ImportStagedFile] = []
+    defer { stages.forEach { $0.remove() } }
+    for file in files {
+        let prepared = try autoreleasepool { () throws -> (ImportEntry, ImportStagedFile) in
+            var inputArgs = file
+            inputArgs["runID"] = runID.uuidString; inputArgs["albumName"] = albumName
+            let input = try importInput(inputArgs)
+            let stage = try ImportStagedFile(data: input.data, filename: input.filename, parent: directory)
+            let entry = ImportEntry(path: input.url.path, filename: input.filename,
+                sha256: input.sha256, bytes: input.bytes, state: "pending")
+            return (entry, stage)
+        }
+        intent.entries[prepared.0.path] = prepared.0
+        stages.append(prepared.1)
+    }
+    return try await operation(intent, stages)
+}
+
+private func identifiedBatchLedger(_ intent: ImportLedger, albumID: String, assetIDs: [String]) throws -> ImportLedger {
+    guard let paths = intent.orderedPaths, !paths.isEmpty, paths.count == intent.entries.count,
+          Set(paths).count == paths.count, paths.count == assetIDs.count,
+          !albumID.isEmpty, assetIDs.allSatisfy({ !$0.isEmpty }), Set(assetIDs).count == assetIDs.count,
+          intent.albumID == nil,
+          paths.allSatisfy({ intent.entries[$0]?.path == $0 && intent.entries[$0]?.state == "pending" && intent.entries[$0]?.assetID == nil }) else {
+        throw PhotosImportFailure("일괄 가져오기 의도와 새 앨범·사진 ID 목록이 일치하지 않습니다.")
+    }
+    var identified = intent
+    identified.albumID = albumID
+    for (index, path) in paths.enumerated() { identified.entries[path]?.assetID = assetIDs[index] }
+    return identified
+}
+
+private func validateExistingBatchLedger(_ previous: ImportLedger, requested: ImportLedger) throws {
+    guard previous.version == 1, previous.runID == requested.runID,
+          previous.albumName == requested.albumName, previous.orderedPaths == requested.orderedPaths,
+          previous.orderedPaths != nil, previous.entries.count == requested.entries.count,
+          requested.entries.allSatisfy({ path, entry in
+              guard let existing = previous.entries[path] else { return false }
+              return existing.path == entry.path && existing.filename == entry.filename &&
+                  existing.sha256 == entry.sha256 && existing.bytes == entry.bytes
+          }) else {
+        throw PhotosImportFailure("일괄 가져오기 실행 기록과 입력 파일·순서가 다릅니다. 자동으로 다시 가져오지 않습니다.")
+    }
+    guard previous.entries.values.allSatisfy({ $0.state == "complete" }) else {
+        throw PhotosImportFailure("이 실행에 완료 여부가 확인되지 않은 일괄 가져오기 기록이 있습니다. 기록을 보존하며 자동으로 다시 가져오지 않습니다.")
     }
 }
 

@@ -94,7 +94,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 "screenCapture": CGPreflightScreenCaptureAccess(), "photos": photoStatus,
                 "photosAutomation": automation == noErr, "photosAutomationStatus": automation,
                 "busy": busy || permissionBusy, "currentRequest": currentID ?? "", "protocolVersion": 2,
-                "capabilities": ["input-images-v1", "input-images-file-resource-v1"],
+                "capabilities": ["input-images-v1", "input-images-file-resource-v1", "input-images-batch-v1"],
                 "helperVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                 "executable": Bundle.main.executableURL?.path ?? ""]
     }
@@ -158,8 +158,9 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "drag": return try await ui.drag(args)
         case "capture": return try await ui.capture(args)
         case "selection", "albums", "albumItems", "show", "activate": return try PhotosScripting.handle(action, args: args)
-        case "inspect", "export", "revert", "verifyJPEG": return try await media.handle(action, args: args)
+        case "inspect", "export", "retain", "revert", "verifyJPEG": return try await media.handle(action, args: args)
         case "importImage": return try await importer.importImage(args)
+        case "importImages": return try await importer.importImages(args)
         default: throw HostError("지원하지 않는 명령입니다: \(action)")
         }
     }
@@ -196,7 +197,7 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         notice.heightAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
         stack.addArrangedSubview(notice); permissionNoticeLabel = notice
         stack.addArrangedSubview(NSButton(title: "현재 앱 Finder에서 보기", target: self, action: #selector(revealHelper)))
-        stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "재빌드 후 권한이 꼬였으면 아래 버튼으로 이 도우미의 네 권한만 초기화하세요. 앱이 종료되면 설정 커맨드를 다시 실행하고 위 권한을 다시 허용하세요."))
+        stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "같은 개발자 인증서로 재빌드할 때는 권한을 초기화하지 마세요. 승인 문제가 계속될 때만 아래 버튼을 사용하세요. 초기화하면 앱이 종료되고 네 권한을 다시 승인해야 합니다."))
         stack.addArrangedSubview(NSButton(title: "이 앱 권한 초기화 후 종료", target: self, action: #selector(resetPermissions)))
         stack.addArrangedSubview(NSTextField(wrappingLabelWithString: "창을 숨겨도 메뉴 막대의 ‘사진 자동화 → 설정 창 열기’에서 다시 열 수 있습니다. 앱을 다시 실행하거나 설정 커맨드를 실행해도 열립니다."))
         let footer = NSStackView(); footer.orientation = .horizontal; footer.spacing = 12

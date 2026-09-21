@@ -18,8 +18,8 @@ export async function verifyJPEG(bridge, receipt, expectedPath) {
 }
 
 export class PhotoWorkflow {
-  constructor({ bridge, config, runDir, pendingPath, stopped = () => false, log = console.log, now = () => Date.now(), pause = sleep }) {
-    Object.assign(this, { bridge, config, runDir, pendingPath, stopped, log, now, pause });
+  constructor({ bridge, config, runDir, pendingPath, stopped = () => false, log = console.log, now = () => Date.now(), pause = sleep, onComplete = async () => {} }) {
+    Object.assign(this, { bridge, config, runDir, pendingPath, stopped, log, now, pause, onComplete });
     this.used = new Set();
   }
   checkStop() { if (this.stopped()) throw new Error('중지 요청을 확인했습니다. 미완료 사진은 복구 기록을 유지합니다.'); }
@@ -108,6 +108,15 @@ export class PhotoWorkflow {
     Object.assign(record, changes, { updatedAt: new Date(this.now()).toISOString() });
     await atomicJSON(this.pendingPath, record); return record;
   }
+  async complete(record, result, metadataPath) {
+    if (result.item?.id !== record.item?.id || result.item?.filename !== record.item?.filename) throw new Error('완료 기록의 사진 식별자가 다릅니다.');
+    await atomicJSON(metadataPath, result);
+    // The batch manifest must be durable before removing the last recovery
+    // journal; otherwise a crash can make a completed edit appear unprocessed.
+    await this.onComplete(result);
+    await unlink(this.pendingPath);
+    return result;
+  }
   identity(baseline) { return { assetId: baseline.assetId, expectedOriginalFilename: baseline.originalFilename, baselineOriginalSHA256: baseline.originalSHA256 }; }
   async capture(filename, expectedWindow) {
     const state = await this.ui();
@@ -118,6 +127,8 @@ export class PhotoWorkflow {
     return { path: filename, bytes: bytes.length, sha256: sha256(bytes) };
   }
   async finishSaved(record) {
+    const keepEdits = record.version === 2 && record.resultPolicy === 'keep-edits';
+    if (!keepEdits && !(record.version === 1 && record.resultPolicy === undefined)) throw new Error('편집 결과 보존 정책을 확인할 수 없습니다. 기록을 보존합니다.');
     this.checkStop();
     if (!record.exportReceipt) {
       const receipt = await this.bridge.call('export', { ...this.identity(record.baseline), path: record.outputs.jpeg });
@@ -128,6 +139,21 @@ export class PhotoWorkflow {
       this.log('JPEG 저장 및 전체 디코딩·해시 검증 완료');
     } else await verifyJPEG(this.bridge, record.exportReceipt, record.outputs.jpeg);
     this.checkStop();
+    if (keepEdits) {
+      await this.poll(async () => (await this.ui()).viewer && await this.selected(record.item), '저장된 같은 사진 보기 화면');
+      const final = await this.bridge.call('inspect', { ...this.identity(record.baseline), preserveBaseline: true });
+      verifyIdentity(record.baseline, final);
+      if (final.hasAdjustments !== true || !/^[a-f0-9]{64}$/.test(record.exportReceipt.currentSHA256 ?? '') || final.currentSHA256 !== record.exportReceipt.currentSHA256) throw new Error('사진 앱에 남긴 편집 결과가 내보낸 이미지와 다릅니다. 기록을 보존합니다.');
+      const retained = await this.bridge.call('retain', { ...this.identity(record.baseline), path: record.outputs.jpeg, verifiedExportSHA256: record.exportReceipt.sha256 });
+      verifyIdentity(record.baseline, retained);
+      if (retained.retained !== true || retained.hasAdjustments !== true || retained.currentSHA256 !== final.currentSHA256 || retained.path !== record.outputs.jpeg || retained.sha256 !== record.exportReceipt.sha256) throw new Error('도우미의 편집 보존 완료 기록을 확인하지 못했습니다. 복구 기록을 보존합니다.');
+      await this.update(record, { phase: 'retained', retainReceipt: retained });
+      const result = { ...record, status: 'complete', keptEdits: true, completedAt: new Date(this.now()).toISOString(), finalVerification: final };
+      await this.complete(record, result, path.join(this.runDir, '.metadata', `${record.outputBase}-result.json`));
+      this.log('JPEG 검증 완료. 사진 앱의 앨범과 편집 결과를 그대로 유지합니다.');
+      return result;
+    }
+    // Honor the recovery contract of journals made by older versions only.
     await this.update(record, { phase: 'reverting' });
     const restored = await this.bridge.call('revert', { ...this.identity(record.baseline), path: record.outputs.jpeg, verifiedExportSHA256: record.exportReceipt.sha256 });
     verifyIdentity(record.baseline, restored, { restored: true });
@@ -137,8 +163,7 @@ export class PhotoWorkflow {
     const final = await this.bridge.call('inspect', { ...this.identity(record.baseline), preserveBaseline: true });
     verifyIdentity(record.baseline, final, { restored: true });
     const result = { ...record, status: 'complete', completedAt: new Date(this.now()).toISOString(), finalVerification: final };
-    await atomicJSON(path.join(this.runDir, '.metadata', `${record.outputBase}-result.json`), result);
-    await unlink(this.pendingPath);
+    await this.complete(record, result, path.join(this.runDir, '.metadata', `${record.outputBase}-result.json`));
     this.log('원본 복원 및 편집 전 이미지 해시 일치 확인');
     return result;
   }
@@ -151,10 +176,12 @@ export class PhotoWorkflow {
     if (baseline.hasAdjustments === true) { this.log('기존 편집 사진 건너뜀'); return { item, status: 'skipped-existing-edits' }; }
     if (baseline.hasAdjustments !== false) throw new Error('기존 편집 여부를 판단하지 못했습니다.');
     if (!(await this.ui()).viewer || !await this.selected(item)) throw new Error('편집 전에 선택한 사진이 바뀌었습니다.');
-    const outputBase = outputStem(baseline.originalFilename, this.used);
-    const outputs = { preview: path.join(this.runDir, `${outputBase}-preview-capture.png`), resultCapture: path.join(this.runDir, `${outputBase}-result-capture.png`), jpeg: path.join(this.runDir, `${outputBase}-result.jpg`) };
-    if (Object.values(outputs).some(existsSync)) throw new Error('기존 출력 파일을 덮어쓸 수 없습니다.');
-    const record = { version: 1, item, baseline, outputBase, outputs, runDir: this.runDir, phase: 'editing', startedAt: new Date(this.now()).toISOString() };
+    let outputBase, outputs;
+    do {
+      outputBase = outputStem(baseline.originalFilename, this.used);
+      outputs = { preview: path.join(this.runDir, `${outputBase}-preview-capture.png`), resultCapture: path.join(this.runDir, `${outputBase}-result-capture.png`), jpeg: path.join(this.runDir, `${outputBase}-result.jpg`) };
+    } while (Object.values(outputs).some(existsSync));
+    const record = { version: 2, resultPolicy: 'keep-edits', item, baseline, outputBase, outputs, runDir: this.runDir, phase: 'editing', startedAt: new Date(this.now()).toISOString() };
     await atomicJSON(this.pendingPath, record, { exclusive: true });
     this.log(`편집 시작: ${baseline.originalFilename}`);
     const editConfirmation = await this.enterEditor(item);
@@ -245,7 +272,6 @@ export class PhotoWorkflow {
       throw new Error('복구 JPEG는 있지만 영수증이 없습니다. 원본 상태는 확인했으며 기록을 보존합니다.');
     }
     const result={...record,status:'recovered-without-result',phase:'restored',finalVerification:actual};
-    await atomicJSON(path.join(this.runDir,'.metadata',`${record.outputBase}-recovery.json`),result);
-    await unlink(this.pendingPath);return result;
+    return this.complete(record, result, path.join(this.runDir, '.metadata', `${record.outputBase}-recovery.json`));
   }
 }

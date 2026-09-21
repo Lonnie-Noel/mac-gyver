@@ -130,6 +130,12 @@ async function fixture(t, options = {}) {
         if (env.verifyError) throw env.verifyError;
         assert.deepEqual(await readFile(args.path), JPEG);
         return { sha256: args.sha256, width: args.width, height: args.height };
+      case 'retain':
+        assert.equal(env.edited, true);
+        assert.equal(args.assetId, ITEM.id);
+        assert.equal(args.verifiedExportSHA256, sha256(JPEG));
+        assert.deepEqual(await readFile(args.path), JPEG);
+        return { ...current(), retained: true, path: args.path, sha256: args.verifiedExportSHA256, ...env.retainChanges };
       case 'revert':
         assert.equal(call.pending?.phase, 'reverting');
         assert.equal(args.assetId, ITEM.id);
@@ -150,21 +156,85 @@ async function fixture(t, options = {}) {
 const callsFor = (env, action) => env.calls.filter(call => call.action === action);
 const pressCalls = (env, selector) => callsFor(env, 'press').filter(call => sameSelector(call.args.selector, selector));
 
-test('one-photo workflow commits Save/Done, verifies JPEG before restoring, then removes the pending journal', async t => {
+test('legacy version-one recovery still fulfills its recorded restore contract after a saved edit', async t => {
+  const { workflow, env, pending, pendingPath } = await fixture(t);
+  env.exportError = new Error('crash after save');
+  await assert.rejects(workflow.process(ITEM), /crash after save/);
+  const record = await pending();
+  record.version = 1;
+  delete record.resultPolicy;
+  await writeFile(pendingPath, JSON.stringify(record));
+  env.exportError = null;
+  const result = await workflow.recover(record);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.restoreReceipt.restored, true);
+  assert.equal(result.finalVerification.hasAdjustments, false);
+  assert.equal(result.finalVerification.currentSHA256, BASELINE.currentSHA256);
+  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(await pending(), null);
+});
+
+for (const changed of [
+  { hasAdjustments: false, currentSHA256: BASELINE.currentSHA256 },
+  { hasAdjustments: true, currentSHA256: 'd'.repeat(64) },
+]) {
+  test(`retention refuses a post-export asset change and preserves recovery: ${changed.currentSHA256[0]}`, async t => {
+    const { workflow, env, pending } = await fixture(t);
+    env.hook = async action => { if (action === 'verifyJPEG') env.inspectChanges = changed; };
+    await assert.rejects(workflow.process(ITEM), /남긴 편집 결과가 내보낸 이미지와 다릅니다/);
+    assert.equal((await pending()).phase, 'exported');
+    assert.ok(existsSync((await pending()).outputs.jpeg));
+    assert.equal(callsFor(env, 'revert').length, 0);
+  });
+}
+
+test('retry after an unsaved failure allocates a new output suffix without overwriting its preview', async t => {
+  const { workflow, env, runDir } = await fixture(t);
+  const old = path.join(runDir, 'IMG_4321-preview-capture.png');
+  const evidence = Buffer.from('previous attempt');
+  await writeFile(old, evidence);
+  const result = await workflow.process(ITEM);
+  assert.equal(result.status, 'complete');
+  assert.equal(result.outputBase, 'IMG_4321-002');
+  assert.deepEqual(await readFile(old), evidence);
+  assert.equal(callsFor(env, 'revert').length, 0);
+});
+
+test('recovery never interprets an unknown retention policy as authorization to restore', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.exportError = new Error('crash after save');
+  await assert.rejects(workflow.process(ITEM), /crash after save/);
+  const record = await pending();
+  record.resultPolicy = 'unknown';
+  env.exportError = null;
+  env.calls.length = 0;
+  await assert.rejects(workflow.recover(record), /보존 정책/);
+  assert.equal(callsFor(env, 'export').length, 0);
+  assert.equal(callsFor(env, 'revert').length, 0);
+  assert.ok(await pending());
+});
+
+test('one-photo workflow commits Save/Done, verifies JPEG, retains the edited asset and removes its pending journal', async t => {
   const { workflow, env, pending, runDir } = await fixture(t);
   const result = await workflow.process(ITEM);
   assert.equal(result.status, 'complete');
-  assert.equal(result.restoreReceipt.restored, true);
-  assert.equal(result.finalVerification.currentSHA256, BASELINE.currentSHA256);
+  assert.equal(result.keptEdits, true);
+  assert.equal(result.resultPolicy, 'keep-edits');
+  assert.equal(result.phase, 'retained');
+  assert.equal(result.retainReceipt.retained, true);
+  assert.equal(result.restoreReceipt, undefined);
+  assert.equal(result.finalVerification.hasAdjustments, true);
+  assert.equal(result.finalVerification.currentSHA256, 'c'.repeat(64));
+  assert.equal(env.edited, true);
   assert.equal(await pending(), null);
   const index = predicate => env.calls.findIndex(predicate);
   assert.ok(index(call => call.action === 'press' && sameSelector(call.args.selector, selectors.save))
     < index(call => call.action === 'press' && sameSelector(call.args.selector, selectors.done)));
   assert.ok(index(call => call.action === 'press' && sameSelector(call.args.selector, selectors.done)) < index(call => call.action === 'export'));
   assert.ok(index(call => call.action === 'export') < index(call => call.action === 'verifyJPEG'));
-  assert.ok(index(call => call.action === 'verifyJPEG') < index(call => call.action === 'revert'));
+  assert.ok(index(call => call.action === 'verifyJPEG') < env.calls.findLastIndex(call => call.action === 'inspect'));
   assert.equal(callsFor(env, 'show').length, 1);
-  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
   const entryPresses = pressCalls(env, REFRAME_ENTRY);
   const generationPresses = pressCalls(env, REFRAME_GENERATE);
   assert.equal(entryPresses.length, 1);
@@ -303,7 +373,7 @@ test('Done returning attributeUnsupported after committing the exact photo is ve
   assert.equal(callsFor(env, 'export').length, 1);
   assert.deepEqual(callsFor(env, 'export')[0].pending.doneConfirmation, result.doneConfirmation,
     'the confirmed ambiguous transition must be journaled before exporting');
-  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
   assert.equal(await pending(), null);
 });
 
@@ -564,7 +634,7 @@ test('a stale AX element after Tools triggers a fresh tree read and never replay
   assert.equal(callsFor(env, 'drag').length, 1);
   assert.equal(callsFor(env, 'capture').length, 2);
   assert.equal(callsFor(env, 'export').length, 1);
-  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
   assert.equal(await pending(), null);
 });
 
@@ -684,7 +754,7 @@ test('export waits until PhotoKit reports the committed edit after two stale une
   assert.equal(result.status, 'complete');
   assert.deepEqual(committedFlags, [false, false, true]);
   assert.equal(callsFor(env, 'export').length, 1);
-  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
   assert.equal(await pending(), null);
 });
 
@@ -802,7 +872,7 @@ test('saved-photo recovery uses the exact recorded asset/hash and does not show 
   }
   assert.equal(pressCalls(env, selectors.edit).length, 0);
   assert.equal(pressCalls(env, selectors.save).length, 0);
-  assert.equal(callsFor(env, 'revert').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
 });
 
 test('recovery identity mismatch leaves the journal intact and never navigates or restores', async t => {
@@ -905,4 +975,79 @@ test('JPEG verification rejects a mismatched destination before asking native co
   await assert.rejects(verifyJPEG(bridge, { path: path.join(runDir, 'different.jpg'),
     sha256: sha256(JPEG), bytes: JPEG.length, width: 4000, height: 3000 }, expectedPath), /요청 경로/);
   assert.equal(callsFor(env, 'verifyJPEG').length, 0);
+});
+
+test('invalid native retain receipt preserves the pending journal and edited result', async t => {
+  const { workflow, env, pending } = await fixture(t);
+  env.retainChanges = { retained: false };
+  await assert.rejects(workflow.process(ITEM), /보존 완료 기록/);
+  assert.equal((await pending()).phase, 'exported');
+  assert.equal(env.edited, true);
+  assert.equal(callsFor(env, 'revert').length, 0);
+});
+
+test('manifest completion failure keeps the pending journal after retained JPEG verification and recovers without re-export', async t => {
+  const { workflow, env, pending, pendingPath, runDir } = await fixture(t);
+  let completionAttempts = 0;
+  workflow.onComplete = async result => {
+    completionAttempts++;
+    assert.equal(result.keptEdits, true);
+    assert.equal(result.status, 'complete');
+    assert.ok(existsSync(pendingPath), 'pending must survive until manifest persistence succeeds');
+    assert.ok(existsSync(path.join(runDir, '.metadata', `${result.outputBase}-result.json`)));
+    throw new Error('manifest storage full');
+  };
+  await assert.rejects(workflow.process(ITEM), /manifest storage full/);
+  const record = await pending();
+  assert.equal(record.phase, 'retained');
+  assert.equal(env.edited, true);
+  assert.equal(completionAttempts, 1);
+  workflow.onComplete = async result => {
+    completionAttempts++;
+    assert.equal(result.item.id, ITEM.id);
+    assert.ok(existsSync(pendingPath));
+  };
+  await workflow.recover(record);
+  assert.equal(await pending(), null);
+  assert.equal(completionAttempts, 2);
+  assert.equal(callsFor(env, 'export').length, 1);
+  assert.equal(callsFor(env, 'revert').length, 0);
+});
+
+test('legacy restored completion persists its callback before deleting pending', async t => {
+  const { workflow, env, pending, pendingPath } = await fixture(t);
+  env.exportError = new Error('stop before export');
+  await assert.rejects(workflow.process(ITEM), /stop before export/);
+  const record = await pending();
+  record.version = 1;
+  delete record.resultPolicy;
+  await writeFile(pendingPath, JSON.stringify(record));
+  env.exportError = null;
+  workflow.onComplete = async result => {
+    assert.equal(result.finalVerification.hasAdjustments, false);
+    assert.ok(existsSync(pendingPath));
+    throw new Error('legacy manifest unavailable');
+  };
+  await assert.rejects(workflow.recover(record), /legacy manifest unavailable/);
+  assert.equal((await pending()).phase, 'restored');
+  assert.equal(env.edited, false);
+});
+
+test('recovered-without-result completion also keeps pending until the manifest callback succeeds', async t => {
+  const { workflow, env, pending, pendingPath, runDir } = await fixture(t);
+  env.hook = async action => { if (action === 'drag') throw new Error('stop before drag'); };
+  await assert.rejects(workflow.process(ITEM), /stop before drag/);
+  const record = await pending();
+  env.hook = null;
+  workflow.onComplete = async result => {
+    assert.equal(result.status, 'recovered-without-result');
+    assert.ok(existsSync(pendingPath));
+    assert.ok(existsSync(path.join(runDir, '.metadata', `${result.outputBase}-recovery.json`)));
+    throw new Error('recovery manifest unavailable');
+  };
+  await assert.rejects(workflow.recover(record), /recovery manifest unavailable/);
+  assert.ok(await pending());
+  workflow.onComplete = async () => { assert.ok(existsSync(pendingPath)); };
+  await workflow.recover(await pending());
+  assert.equal(await pending(), null);
 });

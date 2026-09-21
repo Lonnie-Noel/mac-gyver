@@ -15,11 +15,11 @@ const RUN_ID = 'test-run-001';
 const ALBUM_NAME = 'MacGyver 입력 테스트';
 const ALBUM = Object.freeze({ id: 'test-album', name: ALBUM_NAME });
 
-test('input import requires a helper with the file resource fix before importing more copies', () => {
-  for (const status of [undefined, {}, { capabilities: ['input-images-v1'] }, { capabilities: 'input-images-file-resource-v1' }]) {
-    assert.throws(() => requireFileImportSupport(status), /새 도우미.*0\.1\.6/);
+test('input import requires a helper with bulk import support before importing more copies', () => {
+  for (const status of [undefined, {}, { capabilities: ['input-images-v1'] }, { capabilities: ['input-images-file-resource-v1'] }, { capabilities: 'input-images-batch-v1' }]) {
+    assert.throws(() => requireFileImportSupport(status), /새 도우미/);
   }
-  assert.doesNotThrow(() => requireFileImportSupport({ capabilities: ['input-images-v1', 'input-images-file-resource-v1'] }));
+  assert.doesNotThrow(() => requireFileImportSupport({ capabilities: ['input-images-v1', 'input-images-batch-v1'] }));
 });
 
 async function inputDirectory(t, entries = { 'first.jpg': 'synthetic image bytes' }) {
@@ -30,24 +30,23 @@ async function inputDirectory(t, entries = { 'first.jpg': 'synthetic image bytes
 }
 
 function importer(options = {}) {
-  const calls = [];
-  const journal = [];
+  const calls = [], journal = [];
   const bridge = {
     async call(action, args) {
-      assert.equal(action, 'importImage', 'importing input files must not trigger editing or recovery');
+      assert.equal(action, 'importImages', 'input files must be imported in one native transaction');
       calls.push({ action, args: structuredClone(args) });
       const response = {
         album: { ...ALBUM },
-        item: { id: `test-asset-${calls.length}`, filename: args.filename, width: 640, height: 480 },
-        sourceSHA256: args.sha256,
+        imports: args.files.map((source, index) => ({
+          item: { id: `test-asset-${index + 1}`, filename: source.filename, width: 640, height: 480 },
+          sourceSHA256: source.sha256,
+        })),
       };
-      return options.respond ? options.respond(response, calls.length) : response;
+      return options.respond ? options.respond(response) : response;
     },
   };
   const configuration = {
-    runID: RUN_ID,
-    albumName: ALBUM_NAME,
-    stopped: () => false,
+    runID: RUN_ID, albumName: ALBUM_NAME, stopped: () => false,
     onImported: async record => { journal.push(structuredClone(record)); },
     ...options.configuration,
   };
@@ -83,17 +82,10 @@ test('input scan is top-level only and ignores hidden files, README, markers, an
   assert.deepEqual([...result.ignored].sort(), ['.gitkeep', '.hidden.jpg', 'README.md', 'movie.mov', 'nested', 'notes.txt'].sort());
 });
 
-test('limit is applied to the sorted input list rather than filesystem insertion order', async t => {
+test('scan always inventories every image even when the caller has a processing limit', async t => {
   const directory = await inputDirectory(t, { 'z.jpg': 'z', 'b.png': 'b', 'a.jpeg': 'a' });
-  const result = await scanInputImages(directory, { limit: 2 });
-  assert.deepEqual(result.files.map(file => file.filename), ['a.jpeg', 'b.png']);
-});
-
-test('input limits must be positive integers', async t => {
-  const directory = await inputDirectory(t);
-  for (const limit of [0, -1, 1.5, NaN, Infinity, '1']) {
-    await assert.rejects(() => scanInputImages(directory, { limit }), Error, `limit ${String(limit)}`);
-  }
+  const result = await scanInputImages(directory, { limit: 1 });
+  assert.deepEqual(result.files.map(file => file.filename), ['a.jpeg', 'b.png', 'z.jpg']);
 });
 
 test('supported image symlinks and empty files are rejected, including entries beyond the limit', async t => {
@@ -122,28 +114,44 @@ test('empty directories and directories containing only unsupported or hidden fi
   }
 });
 
-test('scan and sequential import preserve source bytes and send exact file identities to native code', async t => {
+test('scan and one bulk import preserve bytes and send all exact file identities together', async t => {
   const entries = { 'two.PNG': Buffer.from([1, 2, 3]), 'one.JPG': Buffer.from([4, 5, 6, 7]) };
-  const directory = await inputDirectory(t, entries);
-  const { files } = await scanInputImages(directory);
-  const f = importer();
-  const result = await importInputImages(f.bridge, files, f.configuration);
+  const directory = await inputDirectory(t, entries), { files } = await scanInputImages(directory);
+  const f = importer(), result = await importInputImages(f.bridge, files, f.configuration);
   assert.deepEqual(result.album, ALBUM);
   assert.equal(result.source, 'input-folder');
   assert.deepEqual(result.items.map(item => item.id), ['test-asset-1', 'test-asset-2']);
+  assert.deepEqual(f.calls, [{ action: 'importImages', args: { runID: RUN_ID, albumName: ALBUM_NAME, files } }]);
   for (let index = 0; index < files.length; index++) {
-    const file = files[index];
-    assert.deepEqual(f.calls[index].args, { runID: RUN_ID, albumName: ALBUM_NAME, ...file });
-    assert.deepEqual(f.journal[index], { source: file, album: ALBUM, item: result.items[index] });
-    assert.deepEqual(await readFile(file.path), entries[file.filename]);
+    assert.deepEqual(f.journal[index], { source: files[index], album: ALBUM, item: result.items[index] });
+    assert.deepEqual(await readFile(files[index].path), entries[files[index].filename]);
   }
 });
 
-test('native source hash or filename mismatches prevent accepting and journaling the imported item', async t => {
-  const { files } = await scanInputImages(await inputDirectory(t));
+test('a malformed LAST import rejects the entire response before journaling any item', async t => {
+  const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
   for (const change of [
-    response => ({ ...response, sourceSHA256: 'f'.repeat(64) }),
-    response => ({ ...response, item: { ...response.item, filename: 'wrong.jpg' } }),
+    entry => ({ ...entry, sourceSHA256: 'f'.repeat(64) }),
+    entry => ({ ...entry, item: { ...entry.item, filename: 'wrong.jpg' } }),
+    ...[{ id: '' }, { id: null }, { id: 'test-asset-1' }, { width: 0 }, { height: -1 }, { width: 1.5 }, { height: Infinity }]
+      .map(properties => entry => ({ ...entry, item: { ...entry.item, ...properties } })),
+  ]) {
+    const f = importer({ respond: response => ({ ...response, imports: [response.imports[0], change(response.imports[1])] }) });
+    await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.journal.length, 0);
+  }
+});
+
+test('bulk import requires the requested album and exact ordered response count', async t => {
+  const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
+  for (const change of [
+    response => ({ ...response, album: undefined }),
+    response => ({ ...response, album: { id: '', name: ALBUM_NAME } }),
+    response => ({ ...response, album: { id: 'album', name: 'different name' } }),
+    response => ({ ...response, imports: response.imports.slice(0, 1) }),
+    response => ({ ...response, imports: [...response.imports, response.imports[0]] }),
+    response => ({ ...response, imports: response.imports.toReversed() }),
   ]) {
     const f = importer({ respond: change });
     await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error);
@@ -151,82 +159,50 @@ test('native source hash or filename mismatches prevent accepting and journaling
   }
 });
 
-test('native item IDs and pixel dimensions must identify a valid imported image', async t => {
-  const { files } = await scanInputImages(await inputDirectory(t));
-  for (const changes of [{ id: '' }, { id: null }, { width: 0 }, { height: -1 }, { width: 1.5 }, { height: Infinity }]) {
-    const f = importer({ respond: response => ({ ...response, item: { ...response.item, ...changes } }) });
-    await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error, JSON.stringify(changes));
-    assert.equal(f.journal.length, 0);
-  }
-});
-
-test('duplicate imported asset IDs stop before journaling the second response', async t => {
+test('all validated import receipts are awaited in input order with no second native request', async t => {
   const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
-  const f = importer({ respond: response => ({ ...response, item: { ...response.item, id: 'same-asset' } }) });
-  await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error);
-  assert.equal(f.calls.length, 2);
-  assert.equal(f.journal.length, 1);
-});
-
-test('all native responses must belong to one album with the same ID and name', async t => {
-  const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
-  for (const album of [{ id: 'different-album', name: ALBUM_NAME }, { id: ALBUM.id, name: 'different name' }]) {
-    const f = importer({ respond: (response, index) => index === 2 ? { ...response, album } : response });
-    await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error);
-    assert.equal(f.journal.length, 1);
-  }
-});
-
-test('a completed import is journaled and awaited before the next native import starts', async t => {
-  const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
-  let releaseFirstJournal;
-  let announceFirstJournal;
-  const gate = new Promise(resolve => { releaseFirstJournal = resolve; });
-  const started = new Promise(resolve => { announceFirstJournal = resolve; });
+  let release, announce;
+  const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { announce = resolve; });
   const events = [];
-  const f = importer({
-    respond(response, index) { events.push(`import-${index}`); return response; },
-    configuration: {
-      async onImported(record) {
-        events.push(`journal-start-${record.item.id}`);
-        if (record.item.id === 'test-asset-1') { announceFirstJournal(); await gate; }
-        events.push(`journal-end-${record.item.id}`);
-      },
-    },
-  });
+  const f = importer({ configuration: { async onImported(record) {
+    events.push(`start-${record.item.id}`);
+    if (record.item.id === 'test-asset-1') { announce(); await gate; }
+    events.push(`end-${record.item.id}`);
+  } } });
   const pending = importInputImages(f.bridge, files, f.configuration);
   await started;
   assert.equal(f.calls.length, 1);
-  releaseFirstJournal();
+  assert.deepEqual(events, ['start-test-asset-1']);
+  release();
   await pending;
-  assert.deepEqual(events, [
-    'import-1', 'journal-start-test-asset-1', 'journal-end-test-asset-1',
-    'import-2', 'journal-start-test-asset-2', 'journal-end-test-asset-2',
-  ]);
+  assert.deepEqual(events, ['start-test-asset-1', 'end-test-asset-1', 'start-test-asset-2', 'end-test-asset-2']);
 });
 
-test('a journal write failure stops imports instead of proceeding without a record', async t => {
+test('receipt write failure is propagated without resending the completed transaction', async t => {
   const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
   const f = importer({ configuration: { onImported: async () => { throw new Error('journal storage unavailable'); } } });
   await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), /journal storage unavailable/);
   assert.equal(f.calls.length, 1);
 });
 
-test('stop before importing makes no native calls and stop after journaling prevents the next import', async t => {
+test('stop before dispatch prevents import; stop during import still journals ALL successful receipts', async t => {
   const { files } = await scanInputImages(await inputDirectory(t, { 'a.jpg': 'a', 'b.jpg': 'b' }));
-  const alreadyStopped = importer({ configuration: { stopped: () => true } });
-  await assert.rejects(() => importInputImages(alreadyStopped.bridge, files, alreadyStopped.configuration), Error);
-  assert.equal(alreadyStopped.calls.length, 0);
-
+  const before = importer({ configuration: { stopped: () => true } });
+  await assert.rejects(() => importInputImages(before.bridge, files, before.configuration), Error);
+  assert.equal(before.calls.length, 0);
   let stopped = false;
-  const journal = [];
-  const f = importer({ configuration: {
-    stopped: () => stopped,
-    onImported: async record => { journal.push(record); stopped = true; },
-  } });
-  await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), Error);
+  const f = importer({ respond: response => { stopped = true; return response; }, configuration: { stopped: () => stopped } });
+  const result = await importInputImages(f.bridge, files, f.configuration);
+  assert.equal(result.items.length, 2);
+  assert.equal(f.journal.length, 2);
   assert.equal(f.calls.length, 1);
-  assert.equal(journal.length, 1);
+});
+
+test('oversized import requests stop before dispatch rather than timing out in native IPC', async () => {
+  const f = importer();
+  const files = [{ path: 'x'.repeat(901_000), filename: 'a.jpg', bytes: 1, sha256: 'a'.repeat(64) }];
+  await assert.rejects(() => importInputImages(f.bridge, files, f.configuration), /요청이 너무 큽니다/);
+  assert.equal(f.calls.length, 0);
 });
 
 function readyBridge(nodes = []) {
@@ -294,7 +270,7 @@ test('default CLI plan hashes InputImages without config, a helper, or any acces
   const inputs = path.join(directory, 'InputImages');
   await mkdir(scripts);
   await mkdir(inputs);
-  for (const filename of ['run.mjs', 'bridge.mjs', 'core.mjs', 'workflow.mjs', 'runtime.mjs', 'setup.mjs', 'input-images.mjs']) {
+  for (const filename of ['run.mjs', 'bridge.mjs', 'core.mjs', 'workflow.mjs', 'runtime.mjs', 'setup.mjs', 'input-images.mjs', 'batch-state.mjs']) {
     await copyFile(new URL(`../scripts/${filename}`, import.meta.url), path.join(scripts, filename));
   }
   // Deliberately not a decodable JPEG: offline planning only inventories bytes.

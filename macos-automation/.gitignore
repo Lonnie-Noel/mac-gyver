@@ -2,6 +2,10 @@
 /logs/
 /artifacts/
 /config.json
+# Signing preferences live in Application Support; never publish copied credentials.
+signing.json
+*.p12
+*.pfx
 /InputImages/*
 !/InputImages/README.md
 .DS_Store

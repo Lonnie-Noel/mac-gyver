@@ -24,6 +24,36 @@ private struct MacPhotoBaseline: Codable {
     var exportHeight: Int?
     var revertRequested = false
     var restored = false
+    // Optional for ledgers written before keep-edits became a terminal policy.
+    var retained: Bool?
+
+    var hasUnfinishedExport: Bool { exportSHA256 != nil && !restored && retained != true }
+
+    func retentionVerification(path: String, verifiedHash: String) throws -> [String: Any] {
+        guard !revertRequested, !restored,
+              let hash = exportSHA256, hash.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              verifiedHash == hash, path == exportPath,
+              let current = exportedCurrentSHA256, current.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              let bytes = exportBytes, bytes >= 4, let width = exportWidth, width > 0,
+              let height = exportHeight, height > 0 else {
+            throw PhotosMediaFailure("검증된 JPEG 경로·해시·크기와 내보내기 기록이 일치해야 편집 결과를 보존 완료할 수 있습니다.")
+        }
+        return ["path": path, "sha256": hash, "bytes": bytes, "width": width, "height": height]
+    }
+
+    func retaining(currentSHA256: String) throws -> MacPhotoBaseline {
+        guard !revertRequested, !restored, currentSHA256 == exportedCurrentSHA256 else {
+            throw PhotosMediaFailure("사진 편집이 내보낸 결과와 달라 보존 완료하지 않습니다.")
+        }
+        var completed = self; completed.retained = true
+        return completed
+    }
+
+    func requireRevertAllowed() throws {
+        guard retained != true else {
+            throw PhotosMediaFailure("편집 결과를 보존 완료한 사진은 자동으로 원본 복원하지 않습니다.")
+        }
+    }
 }
 
 private struct MacPhotoData {
@@ -69,6 +99,7 @@ actor PhotosMedia {
         switch action {
         case "inspect": return try await inspect(args)
         case "export": return try await export(args)
+        case "retain": return try await retain(args)
         case "revert": return try await revert(args)
         default: throw PhotosMediaFailure("지원하지 않는 사진 파일 동작: \(action)")
         }
@@ -98,7 +129,7 @@ actor PhotosMedia {
                 }
             }
         } else if !hasAdjustments(refreshed) {
-            if let previous = ledger[asset.localIdentifier], previous.exportSHA256 != nil && !previous.restored {
+            if let previous = ledger[asset.localIdentifier], previous.hasUnfinishedExport {
                 throw PhotosMediaFailure("미완료 내보내기/복원 기록이 있습니다. 기존 작업을 먼저 복구하세요.")
             }
             ledger[asset.localIdentifier] = MacPhotoBaseline(originalFilename: name,
@@ -154,8 +185,32 @@ actor PhotosMedia {
         return identity(asset, name, originalHash, currentHash, true).merging(verified) { _, new in new }
     }
 
+    private func retain(_ args: [String: Any]) async throws -> [String: Any] {
+        let (asset, name, originalHash, baseline) = try await checkedAsset(args)
+        guard hasAdjustments(asset), let verifiedHash = args["verifiedExportSHA256"] as? String else {
+            throw PhotosMediaFailure("보존할 편집 결과와 검증된 JPEG 해시가 필요합니다.")
+        }
+        let output = try fileURL(args)
+        let verification = try baseline.retentionVerification(path: output.path, verifiedHash: verifiedHash)
+        _ = try verifiedJPEG(verification)
+        let currentHash = sha256(try await imageData(asset, version: .current).data)
+        let completed = try baseline.retaining(currentSHA256: currentHash)
+        let fresh = try fetchAsset(asset.localIdentifier)
+        guard fresh.modificationDate == asset.modificationDate, hasAdjustments(fresh),
+              try originalFilename(fresh) == name else {
+            throw PhotosMediaFailure("편집 결과 보존 확인 중 사진이 변경되었습니다.")
+        }
+        var ledger = try loadLedger(); ledger[asset.localIdentifier] = completed
+        // Terminal native state is durable before the caller removes its pending
+        // journal. Retrying after a crash re-verifies the same asset and JPEG.
+        try saveLedger(ledger)
+        return identity(fresh, name, originalHash, currentHash, true)
+            .merging(["retained": true, "path": output.path, "sha256": verifiedHash]) { _, new in new }
+    }
+
     private func revert(_ args: [String: Any]) async throws -> [String: Any] {
         let (asset, name, originalHash, baseline) = try await checkedAsset(args)
+        try baseline.requireRevertAllowed()
         let output = try fileURL(args)
         guard let verifiedHash = args["verifiedExportSHA256"] as? String, isHash(verifiedHash),
               verifiedHash == baseline.exportSHA256, output.path == baseline.exportPath,

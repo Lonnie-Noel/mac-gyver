@@ -9,8 +9,7 @@ const maximumBytes = 512 * 1024 * 1024;
 
 // Freeze a list and content hashes before touching Photos. Native import reads
 // the bytes again and verifies these hashes before creating any library asset.
-export async function scanInputImages(directory, { limit } = {}) {
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new Error('limit은 양의 정수여야 합니다.');
+export async function scanInputImages(directory) {
   const absolute = path.resolve(directory);
   let info;
   try { info = await lstat(absolute); }
@@ -45,12 +44,12 @@ export async function scanInputImages(directory, { limit } = {}) {
     } finally { await handle.close(); }
   }
   if (!files.length) throw new Error(`InputImages에 지원 이미지가 없습니다. JPG, PNG, HEIC, HEIF, TIFF를 넣어 주세요: ${resolved}`);
-  return { directory: resolved, files: limit === undefined ? files : files.slice(0, limit), ignored };
+  return { directory: resolved, files, ignored };
 }
 
 export function requireFileImportSupport(status) {
-  if (!Array.isArray(status?.capabilities) || !status.capabilities.includes('input-images-file-resource-v1')) {
-    throw new Error('원본 파일 복사 방식이 적용된 새 도우미(0.1.6 이상)가 필요합니다. 설정 창의 보조 앱 종료를 누른 뒤 설정 커맨드로 다시 빌드하세요. 사진은 가져오지 않았습니다.');
+  if (!Array.isArray(status?.capabilities) || !status.capabilities.includes('input-images-batch-v1')) {
+    throw new Error('폴더 전체 일괄 가져오기를 지원하는 새 도우미가 필요합니다. 설정 창의 보조 앱 종료를 누른 뒤 설정 커맨드로 다시 빌드하세요. 사진은 가져오지 않았습니다.');
   }
 }
 
@@ -64,24 +63,32 @@ export async function requireImportReady(bridge) {
 
 export async function importInputImages(bridge, files, { runID, albumName, onImported = async () => {}, stopped = () => false }) {
   if (!Array.isArray(files) || !files.length) throw new Error('가져올 이미지 목록이 없습니다.');
-  let album;
-  const items = [], ids = new Set();
-  for (const source of files) {
-    if (stopped()) throw new Error('가져오기를 중지했습니다.');
-    const result = await bridge.call('importImage', { runID, albumName, ...source });
-    const item = result?.item, returnedAlbum = result?.album;
-    if (!returnedAlbum || typeof returnedAlbum.id !== 'string' || !returnedAlbum.id || returnedAlbum.name !== albumName ||
-        (album && returnedAlbum.id !== album.id) || !item || typeof item.id !== 'string' || !item.id || ids.has(item.id) ||
-        item.filename !== source.filename || result.sourceSHA256 !== source.sha256 ||
-        ![item.width, item.height].every(v => Number.isSafeInteger(v) && v > 0)) {
-      throw new Error(`가져온 사진의 식별자·파일명·해시·앨범 검증에 실패했습니다: ${source.filename}. 가져오기 기록을 보존합니다.`);
-    }
-    album = returnedAlbum;
-    ids.add(item.id); items.push(item);
-    // A failed write stops here; never import the next file without a receipt.
-    await onImported({ source, album, item });
+  if (stopped()) throw new Error('가져오기를 중지했습니다.');
+  // One PhotoKit transaction creates the album and all assets. Never resend an
+  // uncertain request, including after a timeout or a local journal failure.
+  const args = { runID, albumName, files };
+  if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 900_000) throw new Error('일괄 가져오기 요청이 너무 큽니다. InputImages를 더 작은 묶음으로 나눠 주세요. 사진은 가져오지 않았습니다.');
+  const result = await bridge.call('importImages', args);
+  const album = result?.album, imports = result?.imports;
+  if (!album || typeof album.id !== 'string' || !album.id || album.name !== albumName ||
+      !Array.isArray(imports) || imports.length !== files.length) {
+    throw new Error('가져온 전체 사진 목록·앨범 검증에 실패했습니다. 가져오기 기록을 보존하며 요청을 재전송하지 않습니다.');
   }
-  return { source: 'input-folder', album, items };
+  const ids = new Set();
+  const records = imports.map((entry, index) => {
+    const source = files[index], item = entry?.item;
+    if (!item || typeof item.id !== 'string' || !item.id || ids.has(item.id) ||
+        item.filename !== source.filename || entry.sourceSHA256 !== source.sha256 ||
+        ![item.width, item.height].every(value => Number.isSafeInteger(value) && value > 0)) {
+      throw new Error(`가져온 사진의 식별자·파일명·해시 검증에 실패했습니다: ${source.filename}. 가져오기 기록을 보존합니다.`);
+    }
+    ids.add(item.id);
+    return { source, album, item };
+  });
+  // Validate every response before accepting any receipt. If a stop arrives
+  // during import, still persist ALL completed receipts before returning.
+  for (const record of records) await onImported(record);
+  return { source: 'input-folder', album, items: records.map(record => record.item) };
 }
 
 export function verifyImportedAlbum(contents, album, items) {

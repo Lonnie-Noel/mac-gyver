@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { requireNodeVersion } from './runtime.mjs';
+import { resolveSigningIdentity, verifyAppSignature, saveSigningPreference } from './signing.mjs';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -15,7 +16,6 @@ const logPath = path.join(logRoot, 'build.log');
 const appPath = path.join(buildRoot, 'MacPhotosBridge.app');
 const markerPath = path.join(buildRoot, '.source-hash');
 const bundleId = 'local.macgyver.photosautomation';
-const signingIdentity = process.env.MACOS_SIGNING_IDENTITY?.trim() || '-';
 let temporaryRoot;
 let buildLog;
 
@@ -44,7 +44,7 @@ async function requireStoppedBridge() {
 }
 
 async function command(executable, args) {
-  await buildLog.appendFile(`\n${executable} ${JSON.stringify(args)}\n`);
+  await buildLog?.appendFile(`\n${executable} ${JSON.stringify(args)}\n`);
   try {
     const result = await execFileAsync(executable, args, {
       cwd: projectRoot,
@@ -52,10 +52,10 @@ async function command(executable, args) {
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
     });
-    await buildLog.appendFile(result.stdout + result.stderr);
+    await buildLog?.appendFile(result.stdout + result.stderr);
     return result;
   } catch (error) {
-    await buildLog.appendFile((error.stdout || '') + (error.stderr || '') + `${error.message}\n`);
+    await buildLog?.appendFile((error.stdout || '') + (error.stderr || '') + `${error.message}\n`);
     throw error;
   }
 }
@@ -74,9 +74,20 @@ async function main() {
   const plistPath = path.join(nativeRoot, 'Info.plist');
   const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x86_64' : null;
   if (!arch) throw new Error(`지원하지 않는 Mac 아키텍처입니다: ${process.arch}`);
+  const signing = await resolveSigningIdentity({ bundleId, command });
+  const signingIdentity = signing.identity;
+  if (signing.mode === 'adhoc') {
+    console.warn('MACOS_SIGNING_IDENTITY=- 요청으로 임시 서명을 사용합니다. 재빌드 후 권한 재승인이 필요할 수 있으며 저장된 개발자 인증서는 변경하지 않습니다.');
+  } else if (signing.changingIdentity) {
+    console.warn('명시한 새 개발자 인증서로 변경합니다. 이번 빌드 후 macOS 권한 재승인이 필요할 수 있습니다.');
+  } else {
+    console.log(signing.source === 'automatic'
+      ? '유효한 개발자 인증서 하나를 선택했습니다. 서명 검증 후 저장하고 다음 빌드에도 같은 인증서를 사용합니다.'
+      : '저장하거나 명시한 개발자 인증서로 서명합니다.');
+  }
   const hash = createHash('sha256');
   hash.update(JSON.stringify({ bundleId, signingIdentity, arch }));
-  for (const filename of [...swiftSources, plistPath, fileURLToPath(import.meta.url)]) {
+  for (const filename of [...swiftSources, plistPath, fileURLToPath(import.meta.url), fileURLToPath(new URL('./signing.mjs', import.meta.url))]) {
     hash.update(path.relative(projectRoot, filename));
     hash.update('\0');
     hash.update(await fs.readFile(filename));
@@ -89,7 +100,8 @@ async function main() {
 
   if (previousHash === sourceHash && await exists(path.join(appPath, 'Contents', 'MacOS', 'MacPhotosBridge'))) {
     try {
-      await execFileAsync('/usr/bin/codesign', ['--verify', '--strict', appPath]);
+      const signature = await verifyAppSignature(appPath, signing, { command });
+      await saveSigningPreference(signing, signature);
       console.log(`소스 변경 없음: 기존 앱을 사용합니다.\n${appPath}`);
       return;
     } catch {
@@ -125,7 +137,7 @@ async function main() {
   await command('/usr/bin/xcrun', compilerArgs);
   await fs.chmod(executablePath, 0o755);
   await command('/usr/bin/codesign', ['--force', '--sign', signingIdentity, '--identifier', bundleId, temporaryApp]);
-  await command('/usr/bin/codesign', ['--verify', '--strict', temporaryApp]);
+  const signature = await verifyAppSignature(temporaryApp, signing, { command });
 
   // A helper launched while compilation was running must not keep an old binary alive.
   await requireStoppedBridge();
@@ -136,7 +148,11 @@ async function main() {
   if (hadPreviousApp) await fs.rename(appPath, previousApp);
   try {
     await fs.rename(temporaryApp, appPath);
+    await saveSigningPreference(signing, signature);
   } catch (error) {
+    // A signing preference write failure must not strand a replacement app
+    // without the certificate pin needed by the next build.
+    await fs.rm(appPath, { recursive: true, force: true });
     if (hadPreviousApp) await fs.rename(previousApp, appPath);
     throw error;
   }
@@ -144,8 +160,8 @@ async function main() {
   await fs.writeFile(temporaryMarker, `${sourceHash}\n`, { mode: 0o600 });
   await fs.rename(temporaryMarker, markerPath);
   console.log(`빌드와 서명 검증 완료:\n${appPath}\n로그: ${logPath}`);
-  if (signingIdentity === '-') {
-    console.log('로컬 임시 서명을 사용했습니다. 소스 변경 후 다시 빌드하면 macOS 권한 재승인이 필요할 수 있습니다.');
+  if (signing.mode === 'certificate') {
+    console.log(`개발자 인증서와 서명 식별 조건을 저장했습니다: ${signing.preferencePath}\n같은 인증서로 재빌드해도 macOS 정책이나 인증서 변경에 따라 다시 승인이 필요할 수 있습니다.`);
   }
 }
 
