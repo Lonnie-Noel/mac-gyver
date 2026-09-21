@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { requireNodeVersion } from './runtime.mjs';
 
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -60,10 +61,7 @@ async function command(executable, args) {
 }
 
 async function main() {
-  const [major, minor] = process.versions.node.split('.').map(Number);
-  if (major !== 22 || minor < 12) {
-    throw new Error(`Node.js 22.12 이상, 23 미만이 필요합니다. 현재: ${process.versions.node}`);
-  }
+  requireNodeVersion();
   if (process.platform !== 'darwin') throw new Error('이 빌드는 macOS에서만 실행할 수 있습니다.');
   if (await exists(path.join(projectRoot, 'artifacts', 'pending-edit.json'))) {
     throw new Error('미완료 편집 기록이 있습니다. 기존 앱으로 recover를 완료한 뒤 빌드하세요.');
