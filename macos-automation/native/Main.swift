@@ -94,7 +94,8 @@ final class BridgeAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 "screenCapture": CGPreflightScreenCaptureAccess(), "photos": photoStatus,
                 "photosAutomation": automation == noErr, "photosAutomationStatus": automation,
                 "busy": busy || permissionBusy, "currentRequest": currentID ?? "", "protocolVersion": 2,
-                "capabilities": ["input-images-v1"],
+                "capabilities": ["input-images-v1", "input-images-file-resource-v1"],
+                "helperVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                 "executable": Bundle.main.executableURL?.path ?? ""]
     }
 

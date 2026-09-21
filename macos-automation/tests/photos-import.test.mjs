@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
 
-test('native import validates source bytes and preserves pending identities without PhotoKit calls', { skip: process.platform !== 'darwin' }, async t => {
+test('native import preserves staged original bytes, validates streams, and retains pending identities without PhotoKit calls', { skip: process.platform !== 'darwin' }, async t => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'macgyver-import-validation-'));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const [implementation, fixture] = await Promise.all([
@@ -26,5 +26,7 @@ test('native import validates source bytes and preserves pending identities with
   const { stdout } = await execute(executable, [temp], { timeout: 15000 });
   assert.match(stdout, /PhotosImport regression checks passed/);
   assert.match(stdout, /15 rejection cases/);
+  assert.match(stdout, /private byte-identical staging and scoped cleanup/);
+  assert.match(stdout, /resource stream completion and rejection/);
   assert.match(stdout, /no PhotoKit calls/);
 });

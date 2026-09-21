@@ -81,68 +81,75 @@ actor PhotosImport {
         if let album, !album.canPerform(.addContent) {
             throw PhotosImportFailure("기록된 작업 앨범에 사진을 추가할 수 없습니다.")
         }
-        ledger.entries[input.url.path] = ImportEntry(path: input.url.path, filename: input.filename,
-            sha256: input.sha256, bytes: input.bytes, state: "pending")
-        // This intent must reach disk before any PhotoKit creation request.
-        try store.save(ledger, exclusive: previous == nil)
-        let intended = ledger
-        let outcome = ImportTransactionOutcome()
-        do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                PHPhotoLibrary.shared().performChanges {
-                    do {
-                        let albumRequest: PHAssetCollectionChangeRequest
-                        let albumID: String
-                        if let album {
-                            guard let request = PHAssetCollectionChangeRequest(for: album) else {
-                                throw PhotosImportFailure("작업 앨범 변경 요청을 만들지 못했습니다.")
+        // The data overload may rewrite metadata. A private, byte-identical
+        // file keeps the original resource intact without trusting the mutable
+        // input path. Its lifetime includes the performChanges callback.
+        return try await withStagedImportFile(data: input.data, filename: input.filename,
+            directory: stateDirectory) { stagedURL in
+            ledger.entries[input.url.path] = ImportEntry(path: input.url.path, filename: input.filename,
+                sha256: input.sha256, bytes: input.bytes, state: "pending")
+            // This intent must reach disk before any PhotoKit creation request.
+            try store.save(ledger, exclusive: previous == nil)
+            let intended = ledger
+            let outcome = ImportTransactionOutcome()
+            do {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    PHPhotoLibrary.shared().performChanges {
+                        do {
+                            let albumRequest: PHAssetCollectionChangeRequest
+                            let albumID: String
+                            if let album {
+                                guard let request = PHAssetCollectionChangeRequest(for: album) else {
+                                    throw PhotosImportFailure("작업 앨범 변경 요청을 만들지 못했습니다.")
+                                }
+                                albumRequest = request; albumID = album.localIdentifier
+                            } else {
+                                let request = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: input.albumName)
+                                let placeholder = request.placeholderForCreatedAssetCollection
+                                albumRequest = request; albumID = placeholder.localIdentifier
                             }
-                            albumRequest = request; albumID = album.localIdentifier
-                        } else {
-                            let request = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: input.albumName)
-                            let placeholder = request.placeholderForCreatedAssetCollection
-                            albumRequest = request; albumID = placeholder.localIdentifier
-                        }
-                        let assetRequest = PHAssetCreationRequest.forAsset()
-                        guard let placeholder = assetRequest.placeholderForCreatedAsset else {
-                            throw PhotosImportFailure("새 사진 ID를 확인하지 못했습니다.")
-                        }
-                        var identified = intended
-                        identified.albumID = albumID
-                        identified.entries[input.url.path]?.assetID = placeholder.localIdentifier
-                        // The block cannot throw to roll back PhotoKit. If this
-                        // write fails, add no resource or album membership and
-                        // keep the earlier pending intent. An empty album may
-                        // remain, so even a reported failure is never retried.
-                        try store.save(identified)
-                        let options = PHAssetResourceCreationOptions()
-                        options.originalFilename = input.filename
-                        assetRequest.addResource(with: .photo, data: input.data, options: options)
-                        albumRequest.addAssets([placeholder] as NSArray)
-                        outcome.prepared(identified)
-                    } catch { outcome.failed(error) }
-                } completionHandler: { success, error in
-                    if let preparationError = outcome.snapshot().error {
-                        continuation.resume(throwing: preparationError)
-                    } else if let error { continuation.resume(throwing: error) }
-                    else if !success { continuation.resume(throwing: PhotosImportFailure("사진 보관함 가져오기 결과를 확인하지 못했습니다.")) }
-                    else { continuation.resume() }
+                            let assetRequest = PHAssetCreationRequest.forAsset()
+                            guard let placeholder = assetRequest.placeholderForCreatedAsset else {
+                                throw PhotosImportFailure("새 사진 ID를 확인하지 못했습니다.")
+                            }
+                            var identified = intended
+                            identified.albumID = albumID
+                            identified.entries[input.url.path]?.assetID = placeholder.localIdentifier
+                            // The block cannot throw to roll back PhotoKit. If this
+                            // write fails, add no resource or album membership and
+                            // keep the earlier pending intent. An empty album may
+                            // remain, so even a reported failure is never retried.
+                            try store.save(identified)
+                            let options = PHAssetResourceCreationOptions()
+                            options.originalFilename = input.filename
+                            options.shouldMoveFile = false
+                            assetRequest.addResource(with: .photo, fileURL: stagedURL, options: options)
+                            albumRequest.addAssets([placeholder] as NSArray)
+                            outcome.prepared(identified)
+                        } catch { outcome.failed(error) }
+                    } completionHandler: { success, error in
+                        if let preparationError = outcome.snapshot().error {
+                            continuation.resume(throwing: preparationError)
+                        } else if let error { continuation.resume(throwing: error) }
+                        else if !success { continuation.resume(throwing: PhotosImportFailure("사진 보관함 가져오기 결과를 확인하지 못했습니다.")) }
+                        else { continuation.resume() }
+                    }
                 }
-            }
-            guard var completed = outcome.snapshot().ledger,
-                  var entry = completed.entries[input.url.path] else {
-                throw PhotosImportFailure("가져온 사진의 정확한 ID 기록이 없습니다.")
-            }
-            let result = try await validatedResult(completed, entry: entry)
-            guard let item = result["item"] as? [String: Any],
-                  let width = item["width"] as? Int, let height = item["height"] as? Int else {
-                throw PhotosImportFailure("가져온 사진 크기 응답이 유효하지 않습니다.")
-            }
-            entry.state = "complete"; entry.width = width; entry.height = height
-            completed.entries[input.url.path] = entry
-            try store.save(completed)
-            return result
-        } catch { throw uncertain(error.localizedDescription) }
+                guard var completed = outcome.snapshot().ledger,
+                      var entry = completed.entries[input.url.path] else {
+                    throw PhotosImportFailure("가져온 사진의 정확한 ID 기록이 없습니다.")
+                }
+                let result = try await validatedResult(completed, entry: entry)
+                guard let item = result["item"] as? [String: Any],
+                      let width = item["width"] as? Int, let height = item["height"] as? Int else {
+                    throw PhotosImportFailure("가져온 사진 크기 응답이 유효하지 않습니다.")
+                }
+                entry.state = "complete"; entry.width = width; entry.height = height
+                completed.entries[input.url.path] = entry
+                try store.save(completed)
+                return result
+            } catch { throw uncertain(error.localizedDescription) }
+        }
     }
 
     private func exactAlbum(_ ledger: ImportLedger) throws -> PHAssetCollection {
@@ -223,22 +230,84 @@ private final class ImportResourceCompletion: @unchecked Sendable {
     func receive(_ data: Data) {
         lock.lock(); defer { lock.unlock() }
         guard continuation != nil else { return }
-        if count <= expectedBytes { hasher.update(data: data); count += data.count }
+        hasher.update(data: data)
+        count += data.count
     }
     func complete(_ error: Error?) {
         lock.lock()
-        let pending = continuation; continuation = nil
-        let matches = count == expectedBytes && hasher.finalize().map { String(format: "%02x", $0) }.joined() == expectedSHA256
+        guard let pending = continuation else { lock.unlock(); return }
+        continuation = nil
+        let actualBytes = count
+        let actualSHA256 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let matches = actualBytes == expectedBytes && actualSHA256 == expectedSHA256
         lock.unlock()
-        if let error { pending?.resume(throwing: error) }
-        else if !matches { pending?.resume(throwing: PhotosImportFailure("사진 보관함의 원본 파일 바이트·SHA-256이 입력 파일과 다릅니다.")) }
-        else { pending?.resume() }
+        if let error { pending.resume(throwing: error) }
+        else if !matches {
+            pending.resume(throwing: PhotosImportFailure("사진 보관함의 원본 파일 바이트·SHA-256이 입력 파일과 다릅니다. 입력: \(expectedBytes)바이트, SHA-256 \(expectedSHA256); 보관함: \(actualBytes)바이트, SHA-256 \(actualSHA256)."))
+        } else { pending.resume() }
     }
     func expire() -> Bool {
         lock.lock(); let pending = continuation; continuation = nil; lock.unlock()
         pending?.resume(throwing: PhotosImportFailure("가져온 원본 파일 검증 시간이 초과되었습니다."))
         return pending != nil
     }
+}
+
+/// Only the verified in-memory input is staged. PhotoKit receives no reference
+/// to the user's source file, and the scope survives its asynchronous callback.
+private func withStagedImportFile<T>(data: Data, filename: String, directory: URL,
+    operation: (URL) async throws -> T) async throws -> T {
+    let stage = try ImportStagedFile(data: data, filename: filename, parent: directory)
+    defer { stage.remove() }
+    return try await operation(stage.url)
+}
+
+private struct ImportStagedFile {
+    let directory: URL
+    let url: URL
+
+    init(data: Data, filename: String, parent: URL) throws {
+        guard !data.isEmpty, !filename.isEmpty, filename != ".", filename != "..",
+              !filename.contains("/"), !filename.utf8.contains(0) else {
+            throw PhotosImportFailure("가져오기 임시 파일 이름과 데이터가 올바르지 않습니다.")
+        }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let parentFD = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard parentFD >= 0 else { throw PhotosImportFailure("가져오기 임시 파일의 상위 폴더를 안전하게 열지 못했습니다.") }
+        defer { Darwin.close(parentFD) }
+        let name = ".import-stage-\(UUID().uuidString)"
+        guard mkdirat(parentFD, name, mode_t(0o700)) == 0 else {
+            throw PhotosImportFailure("가져오기 임시 폴더를 만들지 못했습니다.")
+        }
+        directory = parent.appendingPathComponent(name, isDirectory: true)
+        url = directory.appendingPathComponent(filename)
+        do {
+            let directoryFD = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard directoryFD >= 0 else { throw PhotosImportFailure("가져오기 임시 폴더를 안전하게 열지 못했습니다.") }
+            defer { Darwin.close(directoryFD) }
+            guard fchmod(directoryFD, mode_t(0o700)) == 0 else {
+                throw PhotosImportFailure("가져오기 임시 폴더 권한을 제한하지 못했습니다.")
+            }
+            let fd = openat(directoryFD, filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+            guard fd >= 0 else { throw PhotosImportFailure("가져오기 임시 파일을 만들지 못했습니다.") }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            defer { try? handle.close() }
+            guard fchmod(fd, mode_t(0o600)) == 0 else {
+                throw PhotosImportFailure("가져오기 임시 파일 권한을 제한하지 못했습니다.")
+            }
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            guard fsync(directoryFD) == 0, fsync(parentFD) == 0 else {
+                throw PhotosImportFailure("가져오기 임시 파일을 디스크에 동기화하지 못했습니다.")
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
 private func importInput(_ args: [String: Any]) throws -> ImportInput {

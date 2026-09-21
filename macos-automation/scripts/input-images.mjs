@@ -48,6 +48,12 @@ export async function scanInputImages(directory, { limit } = {}) {
   return { directory: resolved, files: limit === undefined ? files : files.slice(0, limit), ignored };
 }
 
+export function requireFileImportSupport(status) {
+  if (!Array.isArray(status?.capabilities) || !status.capabilities.includes('input-images-file-resource-v1')) {
+    throw new Error('원본 파일 복사 방식이 적용된 새 도우미(0.1.6 이상)가 필요합니다. 설정 창의 보조 앱 종료를 누른 뒤 설정 커맨드로 다시 빌드하세요. 사진은 가져오지 않았습니다.');
+  }
+}
+
 export async function requireImportReady(bridge) {
   await bridge.call('activate');
   const snapshot = await bridge.call('snapshot'), state = readUI(snapshot);

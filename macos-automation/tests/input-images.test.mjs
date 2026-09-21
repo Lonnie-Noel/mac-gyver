@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, mkdir, readFile, readdir, writeFile, copyFile, realpath, symlink, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { scanInputImages, importInputImages, requireImportReady, verifyImportedAlbum, waitForImportedAlbum } from '../scripts/input-images.mjs';
+import { scanInputImages, importInputImages, requireFileImportSupport, requireImportReady, verifyImportedAlbum, waitForImportedAlbum } from '../scripts/input-images.mjs';
 import { selectors } from '../scripts/core.mjs';
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -14,6 +14,13 @@ const execute = promisify(execFile);
 const RUN_ID = 'test-run-001';
 const ALBUM_NAME = 'MacGyver 입력 테스트';
 const ALBUM = Object.freeze({ id: 'test-album', name: ALBUM_NAME });
+
+test('input import requires a helper with the file resource fix before importing more copies', () => {
+  for (const status of [undefined, {}, { capabilities: ['input-images-v1'] }, { capabilities: 'input-images-file-resource-v1' }]) {
+    assert.throws(() => requireFileImportSupport(status), /새 도우미.*0\.1\.6/);
+  }
+  assert.doesNotThrow(() => requireFileImportSupport({ capabilities: ['input-images-v1', 'input-images-file-resource-v1'] }));
+});
 
 async function inputDirectory(t, entries = { 'first.jpg': 'synthetic image bytes' }) {
   const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'macgyver-input-images-test-')));

@@ -8,7 +8,7 @@ import { readUI, rotateItems, validateConfig } from './core.mjs';
 import { PhotoWorkflow } from './workflow.mjs';
 import { requireNodeVersion } from './runtime.mjs';
 import { openSettings } from './setup.mjs';
-import { scanInputImages, importInputImages, requireImportReady, verifyImportedAlbum, waitForImportedAlbum } from './input-images.mjs';
+import { scanInputImages, importInputImages, requireFileImportSupport, requireImportReady, verifyImportedAlbum, waitForImportedAlbum } from './input-images.mjs';
 const artifacts=path.join(root,'artifacts'), pendingPath=path.join(artifacts,'pending-edit.json'), stopPath=path.join(artifacts,'STOP'), activePath=path.join(artifacts,'active-run.json'), leasePath=path.join(ipcRoot,'workflow-lock.json');
 const alive=pid=>{if(!Number.isSafeInteger(pid)||pid<1)return false;try{process.kill(pid,0);return true;}catch(e){return e.code==='EPERM';}};
 export function argumentsFor(argv) {
@@ -43,7 +43,7 @@ async function main(){
     console.log(`InputImages: ${input.files.length}장 (파일명 순)\n${input.files.map(f=>f.filename).join('\n')}\n사진 앱에 가져오거나 편집하지 않았습니다.\n계획: ${file}`);return;
   }
   const config=await configuration(options),status=await startBridge(),bridge=createBridge();
-  if(fromInput&&!status.capabilities?.includes('input-images-v1'))throw new Error('InputImages 기능이 있는 새 도우미가 필요합니다. 설정 창의 보조 앱 종료를 누른 뒤 설정 커맨드로 다시 빌드하세요.');
+  if(fromInput)requireFileImportSupport(status);
   if(options.action==='check'){console.log(JSON.stringify(status,null,2));requirePermissions(status);await bridge.call('selection');console.log('보조 앱·권한·사진 ID 조회 확인 완료. 사진은 변경하지 않았습니다.');return;}
   requirePermissions(status);
   if(options.action==='albums'){console.log(JSON.stringify(await bridge.call('albums'),null,2));return;}
