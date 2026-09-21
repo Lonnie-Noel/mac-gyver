@@ -279,9 +279,8 @@ actor PhotosImport {
                 let resources = PHAssetResource.assetResources(for: asset)
                 let originals = resources.filter { $0.type == .photo }
                 guard asset.mediaType == .image, !asset.mediaSubtypes.contains(.photoLive),
-                      !asset.hasAdjustments, !resources.contains(where: { $0.type == .adjustmentData }),
                       originals.count == 1, originals[0].originalFilename == rows[index]["filename"] as? String else {
-                    throw PhotosImportFailure("Reframe에는 편집하지 않은 일반 정지 사진만 넣어 주세요. 동영상·Live Photo·기존 편집 사진은 복사 전에 중단합니다.")
+                    throw PhotosImportFailure("Reframe에는 일반 정지 사진만 넣어 주세요. 동영상·Live Photo는 복사 전에 중단합니다.")
                 }
                 return asset
             }
@@ -291,13 +290,16 @@ actor PhotosImport {
         defer { stages.forEach { $0.remove() } }
         var files: [[String: Any]] = [], sourceItems: [[String: Any]] = []
         for asset in assets {
+            // Always copy the original resource. Existing adjustments stay on
+            // the source asset; never flatten them or revert the source.
             let resource = PHAssetResource.assetResources(for: asset).first { $0.type == .photo }!
             let data = try await cloneResourceData(resource)
             let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             let stage = try ImportStagedFile(data: data, filename: resource.originalFilename, parent: stateDirectory)
             stages.append(stage)
             files.append(["path": stage.url.path, "filename": resource.originalFilename, "sha256": hash, "bytes": data.count])
-            sourceItems.append(["id": asset.localIdentifier, "filename": resource.originalFilename, "sha256": hash, "bytes": data.count])
+            sourceItems.append(["id": asset.localIdentifier, "filename": resource.originalFilename, "sha256": hash, "bytes": data.count,
+                                "sourceVersion": "original", "sourceHadAdjustments": asset.hasAdjustments])
         }
         // Discard stale preparation rather than copying a different revision.
         let fresh = try sourceAssets()
